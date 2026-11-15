@@ -1,0 +1,386 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Student or administrator profile storing academic grade, field, and subscription state.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "email": { "type": "string", "maxLength": 200 },
+        "grade": { "type": "string", "enum": ["دهم", "یازدهم", "دوازدهم", "فارغ‌التحصیل"] },
+        "field": { "type": "string", "enum": ["علوم تجربی", "ریاضی و فیزیک", "ادبیات و علوم انسانی"] },
+        "diamondActive": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "grade", "field", "diamondActive", "createdAt", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Explicit RBAC record granting admin privileges to a user UID.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "maxLength": 200 },
+        "grantedBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "grantedBy", "createdAt"]
+    },
+    "Course": {
+      "title": "Course",
+      "description": "Online educational course (Annual, Nokte-o-Test, CPR, Final Exams).",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "subtitle": { "type": "string", "maxLength": 260 },
+        "instructor": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "instructorTitle": { "type": "string", "maxLength": 160 },
+        "grade": { "type": "string", "enum": ["دهم", "یازدهم", "دوازدهم", "جامع کنکور"] },
+        "category": { "type": "string", "enum": ["زیست‌شناسی", "شیمی", "فیزیک", "ریاضی", "جمع‌بندی CPR"] },
+        "price": { "type": "number" },
+        "discountPrice": { "type": "number" },
+        "durationHours": { "type": "number" },
+        "sessionsCount": { "type": "number" },
+        "imageUrl": { "type": "string", "maxLength": 500 },
+        "description": { "type": "string", "maxLength": 3000 },
+        "isDiamondIncluded": { "type": "boolean" },
+        "featured": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "subtitle", "instructor", "instructorTitle", "grade", "category", "price", "durationHours", "sessionsCount", "imageUrl", "description", "isDiamondIncluded", "featured", "createdAt", "updatedAt"]
+    },
+    "CourseLesson": {
+      "title": "CourseLesson",
+      "description": "Individual session inside a course with syllabus summary, offline recorded video, downloadable booklet, and study notes.",
+      "type": "object",
+      "properties": {
+        "order": { "type": "number" },
+        "title": { "type": "string", "minLength": 2, "maxLength": 200 },
+        "durationMinutes": { "type": "number" },
+        "isFreePreview": { "type": "boolean" },
+        "videoTopic": { "type": "string", "maxLength": 500 },
+        "videoUrl": { "type": "string", "maxLength": 2000 },
+        "bookletTitle": { "type": "string", "maxLength": 200 },
+        "bookletUrl": { "type": "string", "maxLength": 2000 },
+        "keyPoints": { "type": "string", "maxLength": 4000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["order", "title", "durationMinutes", "isFreePreview", "videoTopic", "keyPoints", "createdAt", "updatedAt"]
+    },
+    "Exam": {
+      "title": "Exam",
+      "description": "Mock Konkur or subject exam scheduled according to the strategic study plan.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "code": { "type": "string", "maxLength": 40 },
+        "subject": { "type": "string", "maxLength": 80 },
+        "grade": { "type": "string", "enum": ["دهم", "یازدهم", "دوازدهم", "جامع کنکور"] },
+        "strategyWeek": { "type": "string", "maxLength": 120 },
+        "scheduledDate": { "type": "string", "maxLength": 60 },
+        "durationMinutes": { "type": "number" },
+        "totalQuestions": { "type": "number" },
+        "difficulty": { "type": "string", "enum": ["استاندارد", "سطح کنکور", "چالشی"] },
+        "isActive": { "type": "boolean" },
+        "isDiamondIncluded": { "type": "boolean" },
+        "price": { "type": "number" },
+        "description": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "code", "subject", "grade", "strategyWeek", "scheduledDate", "durationMinutes", "totalQuestions", "difficulty", "isActive", "isDiamondIncluded", "price", "description", "createdAt", "updatedAt"]
+    },
+    "ExamQuestion": {
+      "title": "ExamQuestion",
+      "description": "Multiple-choice question belonging to an exam with detailed answer explanation.",
+      "type": "object",
+      "properties": {
+        "order": { "type": "number" },
+        "subject": { "type": "string", "maxLength": 80 },
+        "topic": { "type": "string", "maxLength": 140 },
+        "stem": { "type": "string", "minLength": 4, "maxLength": 2000 },
+        "option1": { "type": "string", "minLength": 1, "maxLength": 600 },
+        "option2": { "type": "string", "minLength": 1, "maxLength": 600 },
+        "option3": { "type": "string", "minLength": 1, "maxLength": 600 },
+        "option4": { "type": "string", "minLength": 1, "maxLength": 600 },
+        "correctOption": { "type": "number" },
+        "explanation": { "type": "string", "maxLength": 3000 },
+        "difficulty": { "type": "string", "enum": ["ساده", "متوسط", "دشوار"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["order", "subject", "topic", "stem", "option1", "option2", "option3", "option4", "correctOption", "explanation", "difficulty", "createdAt"]
+    },
+    "ExamAttempt": {
+      "title": "ExamAttempt",
+      "description": "Student exam submission and computed report card (percentage, taraz, estimated rank).",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "studentName": { "type": "string", "maxLength": 120 },
+        "examId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "examTitle": { "type": "string", "maxLength": 180 },
+        "correctCount": { "type": "number" },
+        "wrongCount": { "type": "number" },
+        "blankCount": { "type": "number" },
+        "totalQuestions": { "type": "number" },
+        "percentage": { "type": "number" },
+        "taraz": { "type": "number" },
+        "estimatedRank": { "type": "number" },
+        "timeSpentSeconds": { "type": "number" },
+        "answersMap": { "type": "object" },
+        "submittedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "studentName", "examId", "examTitle", "correctCount", "wrongCount", "blankCount", "totalQuestions", "percentage", "taraz", "estimatedRank", "timeSpentSeconds", "answersMap", "submittedAt"]
+    },
+    "Booklet": {
+      "title": "Booklet",
+      "description": "Study booklet, combined notes summary, or PDF test bank resource.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "subject": { "type": "string", "maxLength": 80 },
+        "grade": { "type": "string", "enum": ["دهم", "یازدهم", "دوازدهم", "جامع کنکور"] },
+        "category": { "type": "string", "enum": ["جزوه کلاسی", "نکات ترکیبی", "بانک تست", "برنامه راهبردی"] },
+        "pagesCount": { "type": "number" },
+        "fileSizeLabel": { "type": "string", "maxLength": 40 },
+        "isFree": { "type": "boolean" },
+        "price": { "type": "number" },
+        "description": { "type": "string", "maxLength": 1500 },
+        "summaryContent": { "type": "string", "maxLength": 6000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "subject", "grade", "category", "pagesCount", "fileSizeLabel", "isFree", "price", "description", "summaryContent", "createdAt", "updatedAt"]
+    },
+    "Article": {
+      "title": "Article",
+      "description": "Educational blog article on biology study techniques and Konkur analysis.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 2, "maxLength": 200 },
+        "author": { "type": "string", "maxLength": 120 },
+        "category": { "type": "string", "maxLength": 80 },
+        "readMinutes": { "type": "number" },
+        "excerpt": { "type": "string", "maxLength": 400 },
+        "content": { "type": "string", "maxLength": 8000 },
+        "publishedDate": { "type": "string", "maxLength": 60 },
+        "featured": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "author", "category", "readMinutes", "excerpt", "content", "publishedDate", "featured", "createdAt", "updatedAt"]
+    },
+    "Enrollment": {
+      "title": "Enrollment",
+      "description": "Student enrollment record linking a user to a course and tracking completed lessons.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "courseId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "courseTitle": { "type": "string", "maxLength": 180 },
+        "completedLessonIds": { "type": "array" },
+        "enrolledAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "courseId", "courseTitle", "completedLessonIds", "enrolledAt", "updatedAt"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Checkout order containing purchased courses, booklets, or Diamond subscription.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "studentName": { "type": "string", "maxLength": 120 },
+        "studentEmail": { "type": "string", "maxLength": 200 },
+        "itemTitles": { "type": "array" },
+        "itemIds": { "type": "array" },
+        "includesDiamond": { "type": "boolean" },
+        "totalAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["paid", "pending", "cancelled"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "studentName", "studentEmail", "itemTitles", "itemIds", "includesDiamond", "totalAmount", "status", "createdAt", "updatedAt"]
+    },
+    "Ticket": {
+      "title": "Ticket",
+      "description": "Student educational Q&A support ticket answered by instructors/admins.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "studentName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "studentEmail": { "type": "string", "maxLength": 200 },
+        "subject": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "courseTitle": { "type": "string", "maxLength": 180 },
+        "title": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "questionBody": { "type": "string", "minLength": 4, "maxLength": 3000 },
+        "status": { "type": "string", "enum": ["open", "answered", "closed"] },
+        "instructorName": { "type": "string", "maxLength": 120 },
+        "instructorReply": { "type": "string", "maxLength": 4000 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "studentName", "studentEmail", "subject", "courseTitle", "title", "questionBody", "status", "instructorName", "instructorReply", "createdAt", "updatedAt"]
+    },
+    "ExamNotification": {
+      "title": "ExamNotification",
+      "description": "Scheduled exam start announcement and reminder published by administrators for students.",
+      "type": "object",
+      "properties": {
+        "examId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "examTitle": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "title": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "message": { "type": "string", "minLength": 4, "maxLength": 2000 },
+        "targetGrade": { "type": "string", "enum": ["همه", "دهم", "یازدهم", "دوازدهم", "جامع کنکور"] },
+        "priority": { "type": "string", "enum": ["شروع آزمون", "یادآور ۲۴ ساعته", "فوری", "تغییر زمان"] },
+        "scheduledStartIso": { "type": "string", "maxLength": 40 },
+        "scheduledStartLabel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "isActive": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["examId", "examTitle", "title", "message", "targetGrade", "priority", "scheduledStartIso", "scheduledStartLabel", "isActive", "createdBy", "createdAt", "updatedAt"]
+    },
+    "UserNotificationState": {
+      "title": "UserNotificationState",
+      "description": "Per-student notification preferences, read notification IDs, and exam start reminder subscriptions.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "readNotificationIds": { "type": "array" },
+        "subscribedExamIds": { "type": "array" },
+        "remindMinutesBefore": { "type": "number" },
+        "browserAlertsEnabled": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "readNotificationIds", "subscribedExamIds", "remindMinutesBefore", "browserAlertsEnabled", "updatedAt"]
+    },
+    "LiveClass": {
+      "title": "LiveClass",
+      "description": "Real-time online classroom session managed by admin/instructor with synced board and live Q&A.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 2, "maxLength": 180 },
+        "courseId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "courseTitle": { "type": "string", "minLength": 1, "maxLength": 180 },
+        "instructorName": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "grade": { "type": "string", "enum": ["دهم", "یازدهم", "دوازدهم", "جامع کنکور"] },
+        "subject": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "scheduledLabel": { "type": "string", "minLength": 2, "maxLength": 120 },
+        "status": { "type": "string", "enum": ["scheduled", "live", "ended"] },
+        "boardTitle": { "type": "string", "maxLength": 180 },
+        "boardContent": { "type": "string", "maxLength": 5000 },
+        "streamUrl": { "type": "string", "maxLength": 500 },
+        "isFree": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "courseId", "courseTitle", "instructorName", "grade", "subject", "scheduledLabel", "status", "boardTitle", "boardContent", "streamUrl", "isFree", "createdBy", "createdAt", "updatedAt"]
+    },
+    "LiveClassMessage": {
+      "title": "LiveClassMessage",
+      "description": "Real-time student/instructor message, question, or raise-hand alert inside a live online class.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "senderName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "senderRole": { "type": "string", "enum": ["student", "instructor"] },
+        "messageType": { "type": "string", "enum": ["chat", "question", "hand-raise"] },
+        "text": { "type": "string", "minLength": 1, "maxLength": 1200 },
+        "isPinned": { "type": "boolean" },
+        "isAnswered": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "senderName", "senderRole", "messageType", "text", "isPinned", "isAnswered", "createdAt"]
+    },
+    "LiveClassStroke": {
+      "title": "LiveClassStroke",
+      "description": "Instructor whiteboard drawing stroke synced in real time to students in the live classroom.",
+      "type": "object",
+      "properties": {
+        "color": { "type": "string", "minLength": 1, "maxLength": 24 },
+        "width": { "type": "number" },
+        "path": { "type": "string", "minLength": 2, "maxLength": 4000 },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["color", "width", "path", "createdBy", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private student and admin profile documents."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "RBAC admin allowlist documents."
+    },
+    "/courses/{courseId}": {
+      "schema": { "$ref": "#/entities/Course" },
+      "description": "Publicly readable course catalog managed by admins."
+    },
+    "/courses/{courseId}/lessons/{lessonId}": {
+      "schema": { "$ref": "#/entities/CourseLesson" },
+      "description": "Course lessons and study notes subcollection."
+    },
+    "/exams/{examId}": {
+      "schema": { "$ref": "#/entities/Exam" },
+      "description": "Online mock exams catalog managed by admins."
+    },
+    "/exams/{examId}/questions/{questionId}": {
+      "schema": { "$ref": "#/entities/ExamQuestion" },
+      "description": "Multiple-choice questions for each exam."
+    },
+    "/examAttempts/{attemptId}": {
+      "schema": { "$ref": "#/entities/ExamAttempt" },
+      "description": "Student exam attempts and calculated report cards."
+    },
+    "/booklets/{bookletId}": {
+      "schema": { "$ref": "#/entities/Booklet" },
+      "description": "Educational booklets and study notes catalog."
+    },
+    "/articles/{articleId}": {
+      "schema": { "$ref": "#/entities/Article" },
+      "description": "Educational blog articles and study method guides."
+    },
+    "/enrollments/{enrollmentId}": {
+      "schema": { "$ref": "#/entities/Enrollment" },
+      "description": "Student course enrollments and lesson progress."
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Purchase orders for courses, booklets, and Diamond packages."
+    },
+    "/tickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/Ticket" },
+      "description": "Educational Q&A tickets submitted by students and answered by instructors."
+    },
+    "/examNotifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/ExamNotification" },
+      "description": "Scheduled exam start notifications and alerts managed by admins."
+    },
+    "/userNotificationStates/{userId}": {
+      "schema": { "$ref": "#/entities/UserNotificationState" },
+      "description": "Student notification read states and exam reminder subscriptions."
+    },
+    "/liveClasses/{classId}": {
+      "schema": { "$ref": "#/entities/LiveClass" },
+      "description": "Online classroom sessions scheduled and hosted by administrators/instructors."
+    },
+    "/liveClasses/{classId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/LiveClassMessage" },
+      "description": "Real-time Q&A and chat messages inside a live online class."
+    },
+    "/liveClasses/{classId}/strokes/{strokeId}": {
+      "schema": { "$ref": "#/entities/LiveClassStroke" },
+      "description": "Real-time whiteboard drawing strokes created by the class host."
+    }
+  }
+}
