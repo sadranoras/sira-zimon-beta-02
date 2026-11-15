@@ -52,8 +52,11 @@ import type {
   ExamQuestion,
   GradeLevel,
   LiveClass,
+  LiveClassMediaMode,
   LiveClassMessage,
   LiveClassMessageType,
+  LiveClassParticipant,
+  LiveClassSignal,
   LiveClassStatus,
   LiveClassStroke,
   NotificationPriority,
@@ -247,6 +250,12 @@ interface AppContextValue {
     streamUrl?: string
   ) => Promise<void>;
   setLiveClassStatus: (liveClass: LiveClass, status: LiveClassStatus) => Promise<void>;
+  toggleLiveClassBoard: (liveClass: LiveClass, isBoardOpen: boolean) => Promise<void>;
+  updateHostMediaState: (
+    classId: string,
+    mediaMode: LiveClassMediaMode,
+    micEnabled: boolean
+  ) => Promise<void>;
   deleteLiveClass: (classId: string) => Promise<void>;
   subscribeLiveClassMessages: (
     classId: string,
@@ -272,6 +281,30 @@ interface AppContextValue {
     stroke: { color: string; width: number; path: string }
   ) => Promise<void>;
   clearLiveClassStrokes: (classId: string, strokeIds: string[]) => Promise<void>;
+  subscribeLiveClassParticipants: (
+    classId: string,
+    callback: (participants: LiveClassParticipant[]) => void
+  ) => () => void;
+  upsertMyLiveClassPresence: (
+    classId: string,
+    patch: { cameraRequested?: boolean; cameraActive?: boolean; micActive?: boolean }
+  ) => Promise<void>;
+  setParticipantMediaPermission: (
+    classId: string,
+    targetUserId: string,
+    allowed: boolean
+  ) => Promise<void>;
+  subscribeLiveClassSignals: (
+    classId: string,
+    callback: (signals: LiveClassSignal[]) => void
+  ) => () => void;
+  sendLiveClassSignal: (
+    classId: string,
+    toUid: string,
+    type: 'offer' | 'answer' | 'ice',
+    payload: string
+  ) => Promise<void>;
+  consumeLiveClassSignal: (classId: string, signalId: string) => Promise<void>;
 
   toasts: ToastMessage[];
   notify: (text: string, type?: 'success' | 'error' | 'info') => void;
@@ -714,6 +747,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [user, isAdmin]);
 
+  const hasAutoSeededRef = React.useRef(false);
+
   const seedDatabase = useCallback(async () => {
     if (!user || !isAdmin) {
       notify('فقط مدیر سیستم مجاز به همگام‌سازی پایگاه داده است.', 'error');
@@ -721,9 +756,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
-      const batch = writeBatch(db);
+      // Phase 1: Write parent/root catalog collections first so parent documents exist in Firestore
+      const parentBatch = writeBatch(db);
+
       for (const course of SEED_COURSES) {
         const courseRef = doc(db, 'courses', course.id);
+        const existingCourse = await getDoc(courseRef);
         const coursePayload: Record<string, unknown> = {
           title: course.title,
           subtitle: course.subtitle,
@@ -738,35 +776,21 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           description: course.description,
           isDiamondIncluded: course.isDiamondIncluded,
           featured: course.featured,
-          createdAt: serverTimestamp(),
+          createdAt: existingCourse.exists()
+            ? existingCourse.data().createdAt
+            : serverTimestamp(),
           updatedAt: serverTimestamp(),
         };
         if (typeof course.discountPrice === 'number') {
           coursePayload.discountPrice = course.discountPrice;
         }
-        batch.set(courseRef, coursePayload);
-
-        for (const lesson of course.lessons) {
-          const lessonRef = doc(db, 'courses', course.id, 'lessons', lesson.id);
-          batch.set(lessonRef, {
-            order: lesson.order,
-            title: lesson.title,
-            durationMinutes: lesson.durationMinutes,
-            isFreePreview: lesson.isFreePreview,
-            videoTopic: lesson.videoTopic,
-            videoUrl: (lesson.videoUrl || '').trim().slice(0, 2000),
-            bookletTitle: (lesson.bookletTitle || '').trim().slice(0, 200),
-            bookletUrl: (lesson.bookletUrl || '').trim().slice(0, 2000),
-            keyPoints: lesson.keyPoints,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
+        parentBatch.set(courseRef, coursePayload);
       }
 
       for (const exam of SEED_EXAMS) {
         const examRef = doc(db, 'exams', exam.id);
-        batch.set(examRef, {
+        const existingExam = await getDoc(examRef);
+        parentBatch.set(examRef, {
           title: exam.title,
           code: exam.code,
           subject: exam.subject,
@@ -780,13 +804,85 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           isDiamondIncluded: exam.isDiamondIncluded,
           price: exam.price,
           description: exam.description,
-          createdAt: serverTimestamp(),
+          createdAt: existingExam.exists()
+            ? existingExam.data().createdAt
+            : serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
+      }
 
+      for (const booklet of SEED_BOOKLETS) {
+        const bRef = doc(db, 'booklets', booklet.id);
+        const existingBooklet = await getDoc(bRef);
+        parentBatch.set(bRef, {
+          title: booklet.title,
+          subject: booklet.subject,
+          grade: booklet.grade,
+          category: booklet.category,
+          pagesCount: booklet.pagesCount,
+          fileSizeLabel: booklet.fileSizeLabel,
+          isFree: booklet.isFree,
+          price: booklet.price,
+          description: booklet.description,
+          summaryContent: booklet.summaryContent,
+          createdAt: existingBooklet.exists()
+            ? existingBooklet.data().createdAt
+            : serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      for (const article of SEED_ARTICLES) {
+        const aRef = doc(db, 'articles', article.id);
+        const existingArticle = await getDoc(aRef);
+        parentBatch.set(aRef, {
+          title: article.title,
+          author: article.author,
+          category: article.category,
+          readMinutes: article.readMinutes,
+          excerpt: article.excerpt,
+          content: article.content,
+          publishedDate: article.publishedDate,
+          featured: article.featured,
+          createdAt: existingArticle.exists()
+            ? existingArticle.data().createdAt
+            : serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      await parentBatch.commit();
+
+      // Phase 2: Write subcollections and dependent collections now that parents exist
+      const childBatch = writeBatch(db);
+
+      for (const course of SEED_COURSES) {
+        for (const lesson of course.lessons) {
+          const lessonRef = doc(db, 'courses', course.id, 'lessons', lesson.id);
+          const existingLesson = await getDoc(lessonRef);
+          childBatch.set(lessonRef, {
+            order: lesson.order,
+            title: lesson.title,
+            durationMinutes: lesson.durationMinutes,
+            isFreePreview: lesson.isFreePreview,
+            videoTopic: lesson.videoTopic,
+            videoUrl: (lesson.videoUrl || '').trim().slice(0, 2000),
+            bookletTitle: (lesson.bookletTitle || '').trim().slice(0, 200),
+            bookletUrl: (lesson.bookletUrl || '').trim().slice(0, 2000),
+            keyPoints: lesson.keyPoints,
+            createdAt: existingLesson.exists()
+              ? existingLesson.data().createdAt
+              : serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      }
+
+      for (const exam of SEED_EXAMS) {
         for (const q of exam.questions) {
           const qRef = doc(db, 'exams', exam.id, 'questions', q.id);
-          batch.set(qRef, {
+          const existingQ = await getDoc(qRef);
+          childBatch.set(qRef, {
             order: q.order,
             subject: q.subject,
             topic: q.topic,
@@ -798,48 +894,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             correctOption: q.correctOption,
             explanation: q.explanation,
             difficulty: q.difficulty,
-            createdAt: serverTimestamp(),
+            createdAt: existingQ.exists()
+              ? existingQ.data().createdAt
+              : serverTimestamp(),
           });
         }
       }
 
-      for (const booklet of SEED_BOOKLETS) {
-        const bRef = doc(db, 'booklets', booklet.id);
-        batch.set(bRef, {
-          title: booklet.title,
-          subject: booklet.subject,
-          grade: booklet.grade,
-          category: booklet.category,
-          pagesCount: booklet.pagesCount,
-          fileSizeLabel: booklet.fileSizeLabel,
-          isFree: booklet.isFree,
-          price: booklet.price,
-          description: booklet.description,
-          summaryContent: booklet.summaryContent,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
-      for (const article of SEED_ARTICLES) {
-        const aRef = doc(db, 'articles', article.id);
-        batch.set(aRef, {
-          title: article.title,
-          author: article.author,
-          category: article.category,
-          readMinutes: article.readMinutes,
-          excerpt: article.excerpt,
-          content: article.content,
-          publishedDate: article.publishedDate,
-          featured: article.featured,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-
       for (const notif of SEED_EXAM_NOTIFICATIONS) {
         const nRef = doc(db, 'examNotifications', notif.id);
-        batch.set(nRef, {
+        const existingNotif = await getDoc(nRef);
+        childBatch.set(nRef, {
           examId: notif.examId,
           examTitle: notif.examTitle,
           title: notif.title,
@@ -849,15 +914,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           scheduledStartIso: notif.scheduledStartIso,
           scheduledStartLabel: notif.scheduledStartLabel,
           isActive: notif.isActive,
-          createdBy: user.uid,
-          createdAt: serverTimestamp(),
+          createdBy: existingNotif.exists()
+            ? existingNotif.data().createdBy
+            : user.uid,
+          createdAt: existingNotif.exists()
+            ? existingNotif.data().createdAt
+            : serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
 
       for (const lc of SEED_LIVE_CLASSES) {
         const lcRef = doc(db, 'liveClasses', lc.id);
-        batch.set(lcRef, {
+        const existingLc = await getDoc(lcRef);
+        childBatch.set(lcRef, {
           title: lc.title,
           courseId: lc.courseId,
           courseTitle: lc.courseTitle,
@@ -870,13 +940,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           boardContent: lc.boardContent,
           streamUrl: lc.streamUrl,
           isFree: lc.isFree,
-          createdBy: user.uid,
-          createdAt: serverTimestamp(),
+          createdBy: existingLc.exists()
+            ? existingLc.data().createdBy
+            : user.uid,
+          createdAt: existingLc.exists()
+            ? existingLc.data().createdAt
+            : serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
 
-      await batch.commit();
+      await childBatch.commit();
       notify('تمام دوره‌ها، آزمون‌ها، کلاس‌های آنلاین، جزوات، مقالات و اعلان‌ها در پایگاه داده ذخیره شدند.', 'success');
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'seedDatabase');
@@ -886,6 +960,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Auto-seed once when Admin enters and Firestore catalog is empty
   useEffect(() => {
     if (
+      !hasAutoSeededRef.current &&
       user &&
       isAdmin &&
       firestoreCourses !== null &&
@@ -893,6 +968,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       firestoreCourses.length === 0 &&
       firestoreExams.length === 0
     ) {
+      hasAutoSeededRef.current = true;
       void seedDatabase();
     }
   }, [user, isAdmin, firestoreCourses, firestoreExams, seedDatabase]);
@@ -2072,6 +2148,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         }
 
         const snap = await getDoc(ref);
+        const existingData = snap.exists() ? snap.data() : null;
         const data = {
           title: payload.title.trim(),
           courseId: payload.courseId || 'general',
@@ -2085,6 +2162,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           boardContent: payload.boardContent.trim(),
           streamUrl: payload.streamUrl.trim(),
           isFree: Boolean(payload.isFree),
+          isBoardOpen: existingData && typeof existingData.isBoardOpen === 'boolean' ? existingData.isBoardOpen : true,
+          hostMediaMode: existingData?.hostMediaMode || 'none',
+          hostMicEnabled: Boolean(existingData?.hostMicEnabled),
+          hostUid: existingData?.hostUid || '',
           updatedAt: serverTimestamp(),
         };
 
@@ -2338,6 +2419,214 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [user, isAdmin, notify]
   );
 
+  const toggleLiveClassBoard = useCallback(
+    async (liveClass: LiveClass, isBoardOpen: boolean) => {
+      if (!user || !isAdmin) return;
+      try {
+        await ensureLiveClassParentExists(liveClass.id);
+        await updateDoc(doc(db, 'liveClasses', liveClass.id), {
+          isBoardOpen,
+          updatedAt: serverTimestamp(),
+        });
+        notify(
+          isBoardOpen ? 'تخته هوشمند کلاس باز شد.' : 'تخته هوشمند کلاس بسته شد.',
+          'info'
+        );
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `liveClasses/${liveClass.id}`);
+      }
+    },
+    [user, isAdmin, ensureLiveClassParentExists, notify]
+  );
+
+  const updateHostMediaState = useCallback(
+    async (classId: string, mediaMode: LiveClassMediaMode, micEnabled: boolean) => {
+      if (!user || !isAdmin) return;
+      try {
+        await ensureLiveClassParentExists(classId);
+        await updateDoc(doc(db, 'liveClasses', classId), {
+          hostMediaMode: mediaMode,
+          hostMicEnabled: Boolean(micEnabled),
+          hostUid: mediaMode === 'none' && !micEnabled ? '' : user.uid,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `liveClasses/${classId}`);
+      }
+    },
+    [user, isAdmin, ensureLiveClassParentExists]
+  );
+
+  const subscribeLiveClassParticipants = useCallback(
+    (classId: string, callback: (participants: LiveClassParticipant[]) => void) => {
+      if (!user) {
+        callback([]);
+        return () => {};
+      }
+      const q = query(
+        collection(db, 'liveClasses', classId, 'participants'),
+        orderBy('updatedAt', 'desc')
+      );
+      return onSnapshot(
+        q,
+        (snap) => {
+          callback(snap.docs.map((d) => d.data() as LiveClassParticipant));
+        },
+        (err) => {
+          console.error(err);
+          callback([]);
+        }
+      );
+    },
+    [user]
+  );
+
+  const upsertMyLiveClassPresence = useCallback(
+    async (
+      classId: string,
+      patch: { cameraRequested?: boolean; cameraActive?: boolean; micActive?: boolean }
+    ) => {
+      if (!user) return;
+      const pRef = doc(db, 'liveClasses', classId, 'participants', user.uid);
+      try {
+        const classSnap = await getDoc(doc(db, 'liveClasses', classId));
+        if (!classSnap.exists()) {
+          if (isAdmin) {
+            await ensureLiveClassParentExists(classId);
+          } else {
+            return;
+          }
+        }
+        const existing = await getDoc(pRef);
+        const prev = existing.exists() ? (existing.data() as LiveClassParticipant) : null;
+        const canPublish = isAdmin ? true : Boolean(prev?.canPublishMedia);
+        await setDoc(pRef, {
+          userId: user.uid,
+          displayName: userProfile?.displayName || user.displayName || 'کاربر ماز',
+          role: isAdmin ? 'instructor' : 'student',
+          canPublishMedia: canPublish,
+          cameraRequested:
+            patch.cameraRequested !== undefined
+              ? Boolean(patch.cameraRequested)
+              : Boolean(prev?.cameraRequested),
+          cameraActive: canPublish
+            ? patch.cameraActive !== undefined
+              ? Boolean(patch.cameraActive)
+              : Boolean(prev?.cameraActive)
+            : false,
+          micActive: canPublish
+            ? patch.micActive !== undefined
+              ? Boolean(patch.micActive)
+              : Boolean(prev?.micActive)
+            : false,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (err) {
+        console.error('Presence sync error:', err);
+      }
+    },
+    [user, userProfile, isAdmin, ensureLiveClassParentExists]
+  );
+
+  const setParticipantMediaPermission = useCallback(
+    async (classId: string, targetUserId: string, allowed: boolean) => {
+      if (!user || !isAdmin) return;
+      const pRef = doc(db, 'liveClasses', classId, 'participants', targetUserId);
+      try {
+        const snap = await getDoc(pRef);
+        if (!snap.exists()) return;
+        const data = snap.data() as LiveClassParticipant;
+        await setDoc(pRef, {
+          userId: data.userId,
+          displayName: data.displayName,
+          role: data.role,
+          canPublishMedia: allowed,
+          cameraRequested: allowed ? false : false,
+          cameraActive: allowed ? data.cameraActive : false,
+          micActive: allowed ? data.micActive : false,
+          updatedAt: serverTimestamp(),
+        });
+        notify(
+          allowed
+            ? `دسترسی وب‌کم و میکروفن برای ${data.displayName} فعال شد.`
+            : `دسترسی تصویر و صدای ${data.displayName} بسته شد.`,
+          allowed ? 'success' : 'info'
+        );
+      } catch (err) {
+        handleFirestoreError(
+          err,
+          OperationType.UPDATE,
+          `liveClasses/${classId}/participants/${targetUserId}`
+        );
+      }
+    },
+    [user, isAdmin, notify]
+  );
+
+  const subscribeLiveClassSignals = useCallback(
+    (classId: string, callback: (signals: LiveClassSignal[]) => void) => {
+      if (!user) {
+        callback([]);
+        return () => {};
+      }
+      const q = query(
+        collection(db, 'liveClasses', classId, 'signals'),
+        where('toUid', '==', user.uid)
+      );
+      return onSnapshot(
+        q,
+        (snap) => {
+          callback(
+            snap.docs.map((d) => ({
+              id: d.id,
+              ...(d.data() as Omit<LiveClassSignal, 'id'>),
+            }))
+          );
+        },
+        (err) => {
+          console.error(err);
+          callback([]);
+        }
+      );
+    },
+    [user]
+  );
+
+  const sendLiveClassSignal = useCallback(
+    async (
+      classId: string,
+      toUid: string,
+      type: 'offer' | 'answer' | 'ice',
+      payload: string
+    ) => {
+      if (!user || !toUid) return;
+      const signalId = slugifySafeId('sig');
+      try {
+        await setDoc(doc(db, 'liveClasses', classId, 'signals', signalId), {
+          fromUid: user.uid,
+          toUid,
+          type,
+          payload: payload.slice(0, 12000),
+          createdAt: serverTimestamp(),
+        });
+      } catch (err) {
+        console.error('Signal send error:', err);
+      }
+    },
+    [user]
+  );
+
+  const consumeLiveClassSignal = useCallback(
+    async (classId: string, signalId: string) => {
+      try {
+        await deleteDoc(doc(db, 'liveClasses', classId, 'signals', signalId));
+      } catch {
+        // ignore if already removed
+      }
+    },
+    []
+  );
+
   // Foreground scheduled-exam reminder check for logged-in student
   const alertedIdsRef = React.useRef<Set<string>>(new Set());
   useEffect(() => {
@@ -2460,6 +2749,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         saveLiveClass,
         updateLiveClassBoard,
         setLiveClassStatus,
+        toggleLiveClassBoard,
+        updateHostMediaState,
         deleteLiveClass,
         subscribeLiveClassMessages,
         sendLiveClassMessage,
@@ -2468,6 +2759,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         subscribeLiveClassStrokes,
         addLiveClassStroke,
         clearLiveClassStrokes,
+        subscribeLiveClassParticipants,
+        upsertMyLiveClassPresence,
+        setParticipantMediaPermission,
+        subscribeLiveClassSignals,
+        sendLiveClassSignal,
+        consumeLiveClassSignal,
         toasts,
         notify,
         dismissToast,

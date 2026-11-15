@@ -75,7 +75,9 @@ export const CourseDetailView: React.FC = () => {
   const completedIds = enrollment?.completedLessonIds ?? [];
   const finalPrice = course.discountPrice ?? course.price;
   const canViewLesson = (lesson: CourseLesson) => enrolled || lesson.isFreePreview;
-  const linkedLiveClass = liveClasses.find((lc) => lc.courseId === course.id);
+  const courseLiveClasses = liveClasses.filter((lc) => lc.courseId === course.id);
+  const primaryLiveClass =
+    courseLiveClasses.find((lc) => lc.status === 'live') ?? courseLiveClasses[0];
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -89,17 +91,56 @@ export const CourseDetailView: React.FC = () => {
           <span>بازگشت به همه دوره‌ها</span>
         </button>
 
-        {linkedLiveClass && (
+        {primaryLiveClass && (
           <button
             type="button"
-            onClick={() => openLiveClass(linkedLiveClass.id)}
+            onClick={() => openLiveClass(primaryLiveClass.id)}
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
           >
             <Radio className="w-4 h-4" />
-            <span>ورود به کلاس آنلاین این دوره</span>
+            <span>
+              {primaryLiveClass.status === 'live'
+                ? 'ورود به کلاس آنلاین در حال پخش'
+                : 'ورود به کلاس آنلاین این دوره'}
+            </span>
           </button>
         )}
       </div>
+
+      {courseLiveClasses.length > 0 && (
+        <div className="bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/60 rounded-2xl p-5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Radio className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
+              <span>کلاس‌های آنلاین متصل به این دوره ({toPersianDigits(courseLiveClasses.length)})</span>
+            </h2>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {courseLiveClasses.map((lc) => (
+              <div
+                key={lc.id}
+                className="p-3.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl flex items-center justify-between gap-3"
+              >
+                <div className="min-w-0 space-y-0.5">
+                  <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                    {lc.title}
+                  </p>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    {lc.scheduledLabel} · {lc.isFree ? 'عمومی' : 'اختصاصی ثبت‌نام‌شدگان'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => openLiveClass(lc.id)}
+                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg shrink-0 cursor-pointer"
+                >
+                  ورود
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Course Header Split */}
       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 sm:p-8 grid grid-cols-1 lg:grid-cols-12 gap-8 items-stretch">

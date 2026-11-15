@@ -262,7 +262,7 @@ service cloud.firestore {
 
     function isValidLiveClass(data) {
       return data.keys().hasAll(['title', 'courseId', 'courseTitle', 'instructorName', 'grade', 'subject', 'scheduledLabel', 'status', 'boardTitle', 'boardContent', 'streamUrl', 'isFree', 'createdBy', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['title', 'courseId', 'courseTitle', 'instructorName', 'grade', 'subject', 'scheduledLabel', 'status', 'boardTitle', 'boardContent', 'streamUrl', 'isFree', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['title', 'courseId', 'courseTitle', 'instructorName', 'grade', 'subject', 'scheduledLabel', 'status', 'boardTitle', 'boardContent', 'streamUrl', 'isFree', 'isBoardOpen', 'hostMediaMode', 'hostMicEnabled', 'hostUid', 'createdBy', 'createdAt', 'updatedAt'])
         && data.title is string && data.title.size() >= 2 && data.title.size() <= 180
         && data.courseId is string && isValidId(data.courseId)
         && data.courseTitle is string && data.courseTitle.size() >= 1 && data.courseTitle.size() <= 180
@@ -275,9 +275,36 @@ service cloud.firestore {
         && data.boardContent is string && data.boardContent.size() <= 5000
         && data.streamUrl is string && data.streamUrl.size() <= 500
         && data.isFree is bool
+        && (!('isBoardOpen' in data) || data.isBoardOpen is bool)
+        && (!('hostMediaMode' in data) || data.hostMediaMode in ['none', 'camera', 'screen'])
+        && (!('hostMicEnabled' in data) || data.hostMicEnabled is bool)
+        && (!('hostUid' in data) || (data.hostUid is string && data.hostUid.size() <= 128))
         && data.createdBy is string && isValidId(data.createdBy)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
+    }
+
+    function isValidLiveClassParticipant(data, participantUid) {
+      return data.keys().hasAll(['userId', 'displayName', 'role', 'canPublishMedia', 'cameraRequested', 'cameraActive', 'micActive', 'updatedAt'])
+        && data.keys().hasOnly(['userId', 'displayName', 'role', 'canPublishMedia', 'cameraRequested', 'cameraActive', 'micActive', 'updatedAt'])
+        && data.userId is string && isValidId(data.userId) && data.userId == participantUid
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
+        && data.role in ['instructor', 'student']
+        && data.canPublishMedia is bool
+        && data.cameraRequested is bool
+        && data.cameraActive is bool
+        && data.micActive is bool
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidLiveClassSignal(data) {
+      return data.keys().hasAll(['fromUid', 'toUid', 'type', 'payload', 'createdAt'])
+        && data.keys().hasOnly(['fromUid', 'toUid', 'type', 'payload', 'createdAt'])
+        && data.fromUid is string && isValidId(data.fromUid)
+        && data.toUid is string && isValidId(data.toUid)
+        && data.type in ['offer', 'answer', 'ice']
+        && data.payload is string && data.payload.size() >= 2 && data.payload.size() <= 12000
+        && data.createdAt is timestamp;
     }
 
     function isValidLiveClassMessage(data) {
@@ -365,7 +392,7 @@ service cloud.firestore {
         allow create: if isAdmin()
           && isValidId(courseId)
           && isValidId(lessonId)
-          && exists(/databases/$(database)/documents/courses/$(courseId))
+          && (exists(/databases/$(database)/documents/courses/$(courseId)) || existsAfter(/databases/$(database)/documents/courses/$(courseId)))
           && isValidCourseLesson(incoming())
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
@@ -401,7 +428,7 @@ service cloud.firestore {
         allow create: if isAdmin()
           && isValidId(examId)
           && isValidId(questionId)
-          && exists(/databases/$(database)/documents/exams/$(examId))
+          && (exists(/databases/$(database)/documents/exams/$(examId)) || existsAfter(/databases/$(database)/documents/exams/$(examId)))
           && isValidExamQuestion(incoming())
           && incoming().createdAt == request.time;
         allow update: if isAdmin()
@@ -549,7 +576,7 @@ service cloud.firestore {
         && isValidId(notificationId)
         && isValidExamNotification(incoming())
         && incoming().createdBy == request.auth.uid
-        && (incoming().examId == 'general' || exists(/databases/$(database)/documents/exams/$(incoming().examId)))
+        && (incoming().examId == 'general' || exists(/databases/$(database)/documents/exams/$(incoming().examId)) || existsAfter(/databases/$(database)/documents/exams/$(incoming().examId)))
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
       allow update: if isAdmin()
@@ -593,7 +620,7 @@ service cloud.firestore {
         && isValidId(classId)
         && isValidLiveClass(incoming())
         && incoming().createdBy == request.auth.uid
-        && (incoming().courseId == 'general' || exists(/databases/$(database)/documents/courses/$(incoming().courseId)))
+        && (incoming().courseId == 'general' || exists(/databases/$(database)/documents/courses/$(incoming().courseId)) || existsAfter(/databases/$(database)/documents/courses/$(incoming().courseId)))
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
       allow update: if isAdmin()
@@ -641,6 +668,69 @@ service cloud.firestore {
           && incoming().createdBy == request.auth.uid
           && incoming().createdAt == request.time;
         allow delete: if isAdmin() && isValidId(classId) && isValidId(strokeId);
+      }
+
+      match /participants/{participantUid} {
+        allow get, list: if isSignedIn() && isValidId(classId);
+        allow create: if isVerifiedUser()
+          && isValidId(classId)
+          && isValidId(participantUid)
+          && exists(/databases/$(database)/documents/liveClasses/$(classId))
+          && isValidLiveClassParticipant(incoming(), participantUid)
+          && incoming().updatedAt == request.time
+          && (
+            (isAdmin() && incoming().role == 'instructor') ||
+            (
+              isOwner(participantUid)
+              && incoming().role == 'student'
+              && incoming().canPublishMedia == false
+              && incoming().cameraActive == false
+              && incoming().micActive == false
+            )
+          );
+        allow update: if isVerifiedUser()
+          && isValidId(classId)
+          && isValidId(participantUid)
+          && isValidLiveClassParticipant(incoming(), participantUid)
+          && incoming().userId == existing().userId
+          && incoming().updatedAt == request.time
+          && (
+            isAdmin() ||
+            (
+              isOwner(participantUid)
+              && incoming().role == existing().role
+              && incoming().canPublishMedia == existing().canPublishMedia
+              && (
+                (!incoming().cameraActive && !incoming().micActive) ||
+                existing().canPublishMedia == true
+              )
+            )
+          );
+        allow delete: if isVerifiedUser()
+          && isValidId(classId)
+          && isValidId(participantUid)
+          && (isAdmin() || isOwner(participantUid));
+      }
+
+      match /signals/{signalId} {
+        allow get: if isSignedIn()
+          && isValidId(classId)
+          && isValidId(signalId)
+          && (existing().toUid == request.auth.uid || existing().fromUid == request.auth.uid);
+        allow list: if isSignedIn()
+          && isValidId(classId)
+          && resource.data.toUid == request.auth.uid;
+        allow create: if isVerifiedUser()
+          && isValidId(classId)
+          && isValidId(signalId)
+          && exists(/databases/$(database)/documents/liveClasses/$(classId))
+          && isValidLiveClassSignal(incoming())
+          && incoming().fromUid == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow delete: if isVerifiedUser()
+          && isValidId(classId)
+          && isValidId(signalId)
+          && (isAdmin() || existing().toUid == request.auth.uid || existing().fromUid == request.auth.uid);
       }
     }
   }

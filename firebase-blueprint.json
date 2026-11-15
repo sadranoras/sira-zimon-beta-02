@@ -277,11 +277,44 @@
         "boardContent": { "type": "string", "maxLength": 5000 },
         "streamUrl": { "type": "string", "maxLength": 500 },
         "isFree": { "type": "boolean" },
+        "isBoardOpen": { "type": "boolean" },
+        "hostMediaMode": { "type": "string", "enum": ["none", "camera", "screen"] },
+        "hostMicEnabled": { "type": "boolean" },
+        "hostUid": { "type": "string", "maxLength": 128 },
         "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["title", "courseId", "courseTitle", "instructorName", "grade", "subject", "scheduledLabel", "status", "boardTitle", "boardContent", "streamUrl", "isFree", "createdBy", "createdAt", "updatedAt"]
+    },
+    "LiveClassParticipant": {
+      "title": "LiveClassParticipant",
+      "description": "Online class participant presence and instructor-controlled camera/mic publication permission.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["student", "instructor"] },
+        "canPublishMedia": { "type": "boolean" },
+        "cameraRequested": { "type": "boolean" },
+        "cameraActive": { "type": "boolean" },
+        "micActive": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "displayName", "role", "canPublishMedia", "cameraRequested", "cameraActive", "micActive", "updatedAt"]
+    },
+    "LiveClassSignal": {
+      "title": "LiveClassSignal",
+      "description": "WebRTC signaling message (SDP offer/answer or ICE candidate) exchanged between live class peers.",
+      "type": "object",
+      "properties": {
+        "fromUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "toUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "enum": ["offer", "answer", "ice"] },
+        "payload": { "type": "string", "minLength": 2, "maxLength": 12000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["fromUid", "toUid", "type", "payload", "createdAt"]
     },
     "LiveClassMessage": {
       "title": "LiveClassMessage",
@@ -381,6 +414,14 @@
     "/liveClasses/{classId}/strokes/{strokeId}": {
       "schema": { "$ref": "#/entities/LiveClassStroke" },
       "description": "Real-time whiteboard drawing strokes created by the class host."
+    },
+    "/liveClasses/{classId}/participants/{participantUid}": {
+      "schema": { "$ref": "#/entities/LiveClassParticipant" },
+      "description": "Active live class participants and instructor-approved webcam/mic permissions."
+    },
+    "/liveClasses/{classId}/signals/{signalId}": {
+      "schema": { "$ref": "#/entities/LiveClassSignal" },
+      "description": "WebRTC peer-to-peer signaling messages for instructor/student live video and screen sharing."
     }
   }
 }

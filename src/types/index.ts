@@ -242,6 +242,8 @@ export type ThemeMode = 'light' | 'dark';
 export type LiveClassStatus = 'scheduled' | 'live' | 'ended';
 export type LiveClassMessageType = 'chat' | 'question' | 'hand-raise';
 
+export type LiveClassMediaMode = 'none' | 'camera' | 'screen';
+
 export interface LiveClass {
   id: string;
   title: string;
@@ -256,10 +258,34 @@ export interface LiveClass {
   boardContent: string;
   streamUrl: string;
   isFree: boolean;
+  isBoardOpen?: boolean;
+  hostMediaMode?: LiveClassMediaMode;
+  hostMicEnabled?: boolean;
+  hostUid?: string;
   createdBy: string;
   isSeedOnly?: boolean;
   createdAt?: unknown;
   updatedAt?: unknown;
+}
+
+export interface LiveClassParticipant {
+  userId: string;
+  displayName: string;
+  role: 'student' | 'instructor';
+  canPublishMedia: boolean;
+  cameraRequested: boolean;
+  cameraActive: boolean;
+  micActive: boolean;
+  updatedAt?: unknown;
+}
+
+export interface LiveClassSignal {
+  id: string;
+  fromUid: string;
+  toUid: string;
+  type: 'offer' | 'answer' | 'ice';
+  payload: string;
+  createdAt?: unknown;
 }
 
 export interface LiveClassMessage {

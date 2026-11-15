@@ -155,7 +155,13 @@ export const AdminLiveClassesTab: React.FC = () => {
               </label>
               <select
                 value={courseId}
-                onChange={(e) => setCourseId(e.target.value)}
+                onChange={(e) => {
+                  const nextCourseId = e.target.value;
+                  setCourseId(nextCourseId);
+                  if (!editingId) {
+                    setIsFree(nextCourseId === 'general');
+                  }
+                }}
                 className="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
               >
                 <option value="general">کلاس آنلاین مستقل (عمومی)</option>
@@ -273,10 +279,23 @@ export const AdminLiveClassesTab: React.FC = () => {
             />
           </div>
 
-          <label className="inline-flex items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-            <input type="checkbox" checked={isFree} onChange={(e) => setIsFree(e.target.checked)} />
-            <span>شرکت برای همه دانش‌آموزان آزاد است (جلسه عمومی / رایگان)</span>
-          </label>
+          <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-2">
+            <label className="flex items-center gap-2 text-sm font-medium text-slate-800 dark:text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={!isFree}
+                onChange={(e) => setIsFree(!e.target.checked)}
+              />
+              <span>
+                فقط برای دانش‌آموزان ثبت‌نام‌شده در دوره انتخابی / اشتراک الماس (اختصاصی دوره)
+              </span>
+            </label>
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              {isFree
+                ? 'این کلاس به صورت عمومی و رایگان برای همه کاربران سایت قابل ورود است.'
+                : 'فقط دانش‌آموزانی که در دوره متصل ثبت‌نام کرده‌اند (یا اشتراک الماس دارند) می‌توانند وارد این کلاس شوند.'}
+            </p>
+          </div>
 
           <div className="flex gap-3">
             <button
@@ -320,6 +339,10 @@ export const AdminLiveClassesTab: React.FC = () => {
                   <span className="text-slate-500 dark:text-slate-400">{lc.grade}</span>
                   <span className="text-slate-300 dark:text-slate-700">·</span>
                   <span className="text-slate-500 dark:text-slate-400">{lc.scheduledLabel}</span>
+                  <span className="text-slate-300 dark:text-slate-700">·</span>
+                  <span className={lc.isFree ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}>
+                    {lc.isFree ? 'عمومی / رایگان' : 'اختصاصی ثبت‌نام‌شدگان دوره'}
+                  </span>
                 </div>
                 <p className="text-sm font-bold text-slate-900 dark:text-white">{lc.title}</p>
                 <p className="text-xs text-slate-600 dark:text-slate-400">
