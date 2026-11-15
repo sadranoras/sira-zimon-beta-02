@@ -24,7 +24,13 @@ service cloud.firestore {
     }
 
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        (
+          request.auth.token.firebase.sign_in_provider == 'password' &&
+          request.auth.token.email != 'norassadra1388@gmail.com'
+        )
+      );
     }
 
     function isOwner(userId) {
@@ -32,7 +38,7 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isVerifiedUser() && (
+      return isSignedIn() && request.auth.token.email_verified == true && (
         request.auth.token.email == 'norassadra1388@gmail.com' ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
@@ -41,10 +47,11 @@ service cloud.firestore {
     // --- Validation Blueprints ---
     function isValidUserProfile(data, userId) {
       return data.keys().hasAll(['uid', 'displayName', 'email', 'grade', 'field', 'diamondActive', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['uid', 'displayName', 'email', 'grade', 'field', 'diamondActive', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'phone', 'grade', 'field', 'diamondActive', 'createdAt', 'updatedAt'])
         && data.uid is string && isValidId(data.uid) && data.uid == userId
         && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120
         && data.email is string && data.email.size() <= 200
+        && (!('phone' in data) || (data.phone is string && data.phone.size() <= 20))
         && data.grade in ['دهم', 'یازدهم', 'دوازدهم', 'فارغ‌التحصیل']
         && data.field in ['علوم تجربی', 'ریاضی و فیزیک', 'ادبیات و علوم انسانی']
         && data.diamondActive is bool
@@ -262,7 +269,7 @@ service cloud.firestore {
 
     function isValidLiveClass(data) {
       return data.keys().hasAll(['title', 'courseId', 'courseTitle', 'instructorName', 'grade', 'subject', 'scheduledLabel', 'status', 'boardTitle', 'boardContent', 'streamUrl', 'isFree', 'createdBy', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['title', 'courseId', 'courseTitle', 'instructorName', 'grade', 'subject', 'scheduledLabel', 'status', 'boardTitle', 'boardContent', 'streamUrl', 'isFree', 'isBoardOpen', 'hostMediaMode', 'hostMicEnabled', 'hostUid', 'createdBy', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['title', 'courseId', 'courseTitle', 'instructorName', 'grade', 'subject', 'scheduledLabel', 'startTimeIso', 'endTimeIso', 'status', 'boardTitle', 'boardContent', 'streamUrl', 'isFree', 'isBoardOpen', 'hostMediaMode', 'hostMicEnabled', 'hostUid', 'createdBy', 'createdAt', 'updatedAt'])
         && data.title is string && data.title.size() >= 2 && data.title.size() <= 180
         && data.courseId is string && isValidId(data.courseId)
         && data.courseTitle is string && data.courseTitle.size() >= 1 && data.courseTitle.size() <= 180
@@ -270,6 +277,8 @@ service cloud.firestore {
         && data.grade in ['دهم', 'یازدهم', 'دوازدهم', 'جامع کنکور']
         && data.subject is string && data.subject.size() >= 2 && data.subject.size() <= 80
         && data.scheduledLabel is string && data.scheduledLabel.size() >= 2 && data.scheduledLabel.size() <= 120
+        && (!('startTimeIso' in data) || (data.startTimeIso is string && data.startTimeIso.size() <= 60))
+        && (!('endTimeIso' in data) || (data.endTimeIso is string && data.endTimeIso.size() <= 60))
         && data.status in ['scheduled', 'live', 'ended']
         && data.boardTitle is string && data.boardTitle.size() <= 180
         && data.boardContent is string && data.boardContent.size() <= 5000

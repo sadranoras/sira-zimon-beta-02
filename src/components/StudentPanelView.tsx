@@ -47,7 +47,7 @@ export const StudentPanelView: React.FC = () => {
     addToCart,
     setIsCartOpen,
     cart,
-    signInWithGoogle,
+    openAuthModal,
     signOut,
     updateMyProfile,
   } = useApp();
@@ -82,14 +82,14 @@ export const StudentPanelView: React.FC = () => {
           <UserIcon className="w-10 h-10 text-emerald-700 dark:text-emerald-400 mx-auto" />
           <h1 className="text-2xl font-extrabold text-slate-900 dark:text-white">ورود به پنل کاربری دانش‌آموز</h1>
           <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-            برای دسترسی به کلاس‌های آنلاین، مشاهده کارنامه‌های تراز و رتبه، دریافت جزوات و مدیریت اشتراک الماس با حساب گوگل خود وارد شوید.
+            برای دسترسی به کلاس‌های آنلاین، مشاهده کارنامه‌های تراز و رتبه و دریافت جزوات با شماره تلفن و رمز عبور یا حساب گوگل وارد شوید.
           </p>
           <button
             type="button"
-            onClick={() => void signInWithGoogle()}
+            onClick={openAuthModal}
             className="w-full py-3 px-5 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-500 text-white font-semibold text-sm rounded-lg cursor-pointer"
           >
-            ورود سریع با حساب گوگل
+            ورود / ثبت‌نام در پنل کاربری
           </button>
         </div>
       </div>

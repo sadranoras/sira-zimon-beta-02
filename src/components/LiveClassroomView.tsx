@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   CheckCircle2,
   Eraser,
   ExternalLink,
@@ -16,6 +17,7 @@ import {
   Pin,
   Play,
   Radio,
+  RefreshCw,
   Send,
   ShieldCheck,
   ShoppingBag,
@@ -28,6 +30,7 @@ import {
   VideoOff,
   Volume2,
   VolumeX,
+  Wifi,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { DIAMOND_PACKAGE } from '../data/seedData';
@@ -39,7 +42,7 @@ import type {
   LiveClassParticipant,
   LiveClassStroke,
 } from '../types';
-import { toPersianDigits } from '../utils/formatters';
+import { formatIranScheduleRange, toPersianDigits } from '../utils/formatters';
 
 const PEN_COLORS = [
   { id: 'emerald', hex: '#34d399', label: 'سبز' },
@@ -49,11 +52,51 @@ const PEN_COLORS = [
   { id: 'rose', hex: '#fb7185', label: 'قرمز' },
 ];
 
-const RTC_CONFIG: RTCConfiguration = {
+const DEFAULT_RTC_CONFIG: RTCConfiguration = {
   iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
+      ],
+    },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turns:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 10,
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
 };
+
+async function tuneVideoSenderBitrate(
+  pc: RTCPeerConnection,
+  mode: LiveClassMediaMode | 'student'
+): Promise<void> {
+  const maxBitrate = mode === 'screen' ? 1_100_000 : 550_000;
+  for (const sender of pc.getSenders()) {
+    if (sender.track?.kind !== 'video') continue;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      params.encodings[0].maxBitrate = maxBitrate;
+      params.degradationPreference = 'maintain-framerate';
+      await sender.setParameters(params);
+    } catch {
+      // Some browsers restrict setParameters dynamically
+    }
+  }
+}
 
 interface SignalEnvelope {
   channel: 'host-to-student' | 'student-to-host';
@@ -98,7 +141,7 @@ export const LiveClassroomView: React.FC = () => {
     setIsCartOpen,
     isEnrolledInCourse,
     setView,
-    signInWithGoogle,
+    openAuthModal,
     setLiveClassStatus,
     toggleLiveClassBoard,
     updateHostMediaState,
@@ -170,16 +213,54 @@ export const LiveClassroomView: React.FC = () => {
   const extraCleanupTracksRef = useRef<MediaStreamTrack[]>([]);
   const [mediaMode, setMediaMode] = useState<LiveClassMediaMode>('none');
   const [hostMicEnabled, setHostMicEnabled] = useState(true);
+  const [mediaError, setMediaError] = useState<{
+    title: string;
+    detail: string;
+    isPermissionIssue: boolean;
+  } | null>(null);
 
   // Student local media state (strictly gated by myParticipant.canPublishMedia)
   const [localStudentStream, setLocalStudentStream] = useState<MediaStream | null>(null);
   const localStudentStreamRef = useRef<MediaStream | null>(null);
   const [studentMicEnabled, setStudentMicEnabled] = useState(true);
 
-  // Remote WebRTC media streams
+  // Remote WebRTC media streams & cross-network relay state
   const [remoteHostStream, setRemoteHostStream] = useState<MediaStream | null>(null);
   const [remoteHostAudioMuted, setRemoteHostAudioMuted] = useState(false);
   const [remoteStudentStreams, setRemoteStudentStreams] = useState<Record<string, MediaStream>>({});
+  const [baseRtcConfig, setBaseRtcConfig] = useState<RTCConfiguration>(DEFAULT_RTC_CONFIG);
+  const [forceRelayMode, setForceRelayMode] = useState(false);
+  const [rtcReconnectSeq, setRtcReconnectSeq] = useState(0);
+  const [rtcNetworkStatus, setRtcNetworkStatus] = useState<
+    'idle' | 'connecting' | 'connected' | 'reconnecting'
+  >('idle');
+
+  const effectiveRtcConfig = useMemo<RTCConfiguration>(
+    () => ({
+      ...baseRtcConfig,
+      iceTransportPolicy: forceRelayMode ? 'relay' : 'all',
+    }),
+    [baseRtcConfig, forceRelayMode]
+  );
+  const effectiveRtcConfigRef = useRef<RTCConfiguration>(effectiveRtcConfig);
+  effectiveRtcConfigRef.current = effectiveRtcConfig;
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/rtc-config')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: RTCConfiguration | null) => {
+        if (active && data && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+          setBaseRtcConfig(data);
+        }
+      })
+      .catch(() => {
+        // Fallback to DEFAULT_RTC_CONFIG
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // WebRTC PeerConnection registries
   const hostOutboundPeersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -238,7 +319,27 @@ export const LiveClassroomView: React.FC = () => {
     pendingIceRef.current.clear();
     setRemoteHostStream(null);
     setRemoteStudentStreams({});
+    setRtcNetworkStatus('idle');
   }, []);
+
+  const handleToggleRelayAndReconnect = useCallback(
+    (nextRelay?: boolean) => {
+      closeAllPeerConnections();
+      if (typeof nextRelay === 'boolean') {
+        setForceRelayMode(nextRelay);
+        notify(
+          nextRelay
+            ? 'حالت رله بین‌شبکه‌ای (TURN) برای اتصال پایدار بین اینترنت‌های مختلف فعال شد.'
+            : 'حالت ارتباط پیش‌فرض (P2P + TURN) فعال شد.',
+          'info'
+        );
+      } else {
+        notify('ارتباط زنده تصویر و صدا بازنشانی شد.', 'info');
+      }
+      setRtcReconnectSeq((s) => s + 1);
+    },
+    [closeAllPeerConnections, notify]
+  );
 
   const stopHostMedia = useCallback(
     async (syncFirestore = true, targetClassId = activeClassId) => {
@@ -412,12 +513,29 @@ export const LiveClassroomView: React.FC = () => {
     studentTargets.forEach((student) => {
       if (hostOutboundPeersRef.current.has(student.userId)) return;
 
-      const pc = new RTCPeerConnection(RTC_CONFIG);
+      const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
       hostOutboundPeersRef.current.set(student.userId, pc);
+      setRtcNetworkStatus('connecting');
 
       localHostStream.getTracks().forEach((track) => {
         pc.addTrack(track, localHostStream);
       });
+      void tuneVideoSenderBitrate(pc, mediaMode);
+
+      const sendOffer = async (iceRestart = false) => {
+        try {
+          if (pc.signalingState === 'closed') return;
+          const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+          await pc.setLocalDescription(offer);
+          const envelope: SignalEnvelope = {
+            channel: 'host-to-student',
+            sdp: pc.localDescription?.toJSON() ?? offer,
+          };
+          await sendLiveClassSignal(activeClassId, student.userId, 'offer', JSON.stringify(envelope));
+        } catch (err) {
+          console.error('Host WebRTC offer error:', err);
+        }
+      };
 
       pc.onicecandidate = (ev) => {
         if (ev.candidate) {
@@ -429,6 +547,19 @@ export const LiveClassroomView: React.FC = () => {
         }
       };
 
+      pc.oniceconnectionstatechange = () => {
+        const st = pc.iceConnectionState;
+        if (st === 'connected' || st === 'completed') {
+          setRtcNetworkStatus('connected');
+        } else if (st === 'disconnected') {
+          setRtcNetworkStatus('reconnecting');
+        } else if (st === 'failed') {
+          setRtcNetworkStatus('reconnecting');
+          pc.restartIce();
+          void sendOffer(true);
+        }
+      };
+
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           if (hostOutboundPeersRef.current.get(student.userId) === pc) {
@@ -437,21 +568,18 @@ export const LiveClassroomView: React.FC = () => {
         }
       };
 
-      void (async () => {
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          const envelope: SignalEnvelope = {
-            channel: 'host-to-student',
-            sdp: pc.localDescription?.toJSON() ?? offer,
-          };
-          await sendLiveClassSignal(activeClassId, student.userId, 'offer', JSON.stringify(envelope));
-        } catch (err) {
-          console.error('Host WebRTC offer error:', err);
-        }
-      })();
+      void sendOffer(false);
     });
-  }, [isAdmin, user, activeClassId, localHostStream, participants, sendLiveClassSignal]);
+  }, [
+    isAdmin,
+    user,
+    activeClassId,
+    localHostStream,
+    mediaMode,
+    participants,
+    rtcReconnectSeq,
+    sendLiveClassSignal,
+  ]);
 
   // Permitted Student: Maintain outbound WebRTC connection Student -> Instructor
   useEffect(() => {
@@ -471,12 +599,28 @@ export const LiveClassroomView: React.FC = () => {
       studentOutboundPcRef.current = null;
     }
 
-    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
     studentOutboundPcRef.current = pc;
 
     localStudentStream.getTracks().forEach((track) => {
       pc.addTrack(track, localStudentStream);
     });
+    void tuneVideoSenderBitrate(pc, 'student');
+
+    const sendStudentOffer = async (iceRestart = false) => {
+      try {
+        if (pc.signalingState === 'closed') return;
+        const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+        await pc.setLocalDescription(offer);
+        const envelope: SignalEnvelope = {
+          channel: 'student-to-host',
+          sdp: pc.localDescription?.toJSON() ?? offer,
+        };
+        await sendLiveClassSignal(activeClassId, instructorUid, 'offer', JSON.stringify(envelope));
+      } catch (err) {
+        console.error('Student WebRTC offer error:', err);
+      }
+    };
 
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
@@ -488,19 +632,14 @@ export const LiveClassroomView: React.FC = () => {
       }
     };
 
-    void (async () => {
-      try {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        const envelope: SignalEnvelope = {
-          channel: 'student-to-host',
-          sdp: pc.localDescription?.toJSON() ?? offer,
-        };
-        await sendLiveClassSignal(activeClassId, instructorUid, 'offer', JSON.stringify(envelope));
-      } catch (err) {
-        console.error('Student WebRTC offer error:', err);
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') {
+        pc.restartIce();
+        void sendStudentOffer(true);
       }
-    })();
+    };
+
+    void sendStudentOffer(false);
 
     return () => {
       if (studentOutboundPcRef.current === pc) {
@@ -515,6 +654,7 @@ export const LiveClassroomView: React.FC = () => {
     localStudentStream,
     myParticipant?.canPublishMedia,
     instructorUid,
+    rtcReconnectSeq,
     sendLiveClassSignal,
   ]);
 
@@ -556,8 +696,9 @@ export const LiveClassroomView: React.FC = () => {
             if (incomingHostPcRef.current) {
               incomingHostPcRef.current.close();
             }
-            const pc = new RTCPeerConnection(RTC_CONFIG);
+            const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
             incomingHostPcRef.current = pc;
+            setRtcNetworkStatus('connecting');
             const inboundStream = new MediaStream();
 
             pc.ontrack = (ev) => {
@@ -570,6 +711,15 @@ export const LiveClassroomView: React.FC = () => {
                 inboundStream.addTrack(ev.track);
               }
               setRemoteHostStream(new MediaStream(inboundStream.getTracks()));
+            };
+
+            pc.oniceconnectionstatechange = () => {
+              const st = pc.iceConnectionState;
+              if (st === 'connected' || st === 'completed') {
+                setRtcNetworkStatus('connected');
+              } else if (st === 'disconnected' || st === 'failed') {
+                setRtcNetworkStatus('reconnecting');
+              }
             };
 
             pc.onicecandidate = (ev) => {
@@ -645,7 +795,7 @@ export const LiveClassroomView: React.FC = () => {
           const iceKey = `student-in:${sig.fromUid}`;
           if (sig.type === 'offer' && parsed.sdp) {
             incomingStudentPeersRef.current.get(sig.fromUid)?.close();
-            const pc = new RTCPeerConnection(RTC_CONFIG);
+            const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
             incomingStudentPeersRef.current.set(sig.fromUid, pc);
             const inboundStream = new MediaStream();
 
@@ -742,26 +892,177 @@ export const LiveClassroomView: React.FC = () => {
     sendLiveClassSignal,
   ]);
 
+  const buildMediaDiagnostic = (err: unknown): {
+    title: string;
+    detail: string;
+    isPermissionIssue: boolean;
+  } => {
+    const name =
+      typeof err === 'object' && err !== null && 'name' in err
+        ? String((err as { name?: unknown }).name)
+        : '';
+    const message =
+      typeof err === 'object' && err !== null && 'message' in err
+        ? String((err as { message?: unknown }).message)
+        : '';
+    const lower = `${name} ${message}`.toLowerCase();
+
+    if (
+      name === 'NotAllowedError' ||
+      name === 'PermissionDeniedError' ||
+      name === 'SecurityError' ||
+      lower.includes('permissions policy') ||
+      lower.includes('not allowed') ||
+      lower.includes('denied')
+    ) {
+      return {
+        title: 'دسترسی دوربین یا میکروفن در مرورگر/آیفریم مسدود شده است',
+        detail:
+          'در محیط پیش‌نمایش توکار، ممکن است مرورگر اجازه دسترسی به وب‌کم و میکروفن را ندهد. لطفاً با دکمه زیر کلاس را در تب مستقل مرورگر باز کنید و از آیکون قفل کنار آدرس سایت، دسترسی Camera و Microphone را روی Allow بگذارید.',
+        isPermissionIssue: true,
+      };
+    }
+
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+      return {
+        title: 'دوربین یا میکروفن فعالی روی دستگاه شما پیدا نشد',
+        detail:
+          'لطفاً اتصال وب‌کم و هدست/میکروفن به سیستم را بررسی کنید. اگر فقط میکروفن دارید از دکمه «فقط میکروفن» استفاده کنید.',
+        isPermissionIssue: false,
+      };
+    }
+
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return {
+        title: 'دوربین یا میکروفن توسط برنامه دیگری در حال استفاده است',
+        detail:
+          'نرم‌افزارها یا تب‌های دیگر که از دوربین/میکروفن استفاده می‌کنند را ببندید و دوباره تلاش کنید.',
+        isPermissionIssue: false,
+      };
+    }
+
+    return {
+      title: 'خطا در راه‌اندازی وب‌کم یا میکروفن',
+      detail:
+        'ارتباط با ورودی تصویر و صدا برقرار نشد. پیشنهاد می‌شود کلاس را در پنجره جدید مرورگر باز کرده و دسترسی‌ها را بررسی کنید.',
+      isPermissionIssue: true,
+    };
+  };
+
+  const acquireCameraAndMicStream = async (preferAudioOnly = false): Promise<{
+    stream: MediaStream;
+    hasVideo: boolean;
+    hasAudio: boolean;
+    fallbackNotice?: string;
+  } | null> => {
+    setMediaError(null);
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function'
+    ) {
+      setMediaError({
+        title: 'مرورگر یا پنجره پیش‌نمایش فعلی دسترسی دوربین و صدا را پشتیبانی نمی‌کند',
+        detail:
+          'احتمالاً صفحه در محیط محدود آیفریم یا اتصال غیرایمن باز شده است. با دکمه زیر کلاس را در تب جدید مرورگر باز کنید.',
+        isPermissionIssue: true,
+      });
+      return null;
+    }
+
+    if (preferAudioOnly) {
+      try {
+        const audioStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        return { stream: audioStream, hasVideo: false, hasAudio: true };
+      } catch (err) {
+        const diag = buildMediaDiagnostic(err);
+        setMediaError(diag);
+        notify(diag.title, 'error');
+        return null;
+      }
+    }
+
+    try {
+      const both = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      return {
+        stream: both,
+        hasVideo: both.getVideoTracks().length > 0,
+        hasAudio: both.getAudioTracks().length > 0,
+      };
+    } catch (firstErr) {
+      // Automatic fallback: try audio-only first, then video-only
+      try {
+        const audioOnly = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        return {
+          stream: audioOnly,
+          hasVideo: false,
+          hasAudio: true,
+          fallbackNotice: 'وب‌کم در دسترس نبود؛ میکروفن (پخش صدا) متصل شد.',
+        };
+      } catch {
+        try {
+          const videoOnly = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          return {
+            stream: videoOnly,
+            hasVideo: true,
+            hasAudio: false,
+            fallbackNotice: 'میکروفن یافت نشد یا مسدود بود؛ وب‌کم (بدون صدا) متصل شد.',
+          };
+        } catch {
+          const diag = buildMediaDiagnostic(firstErr);
+          setMediaError(diag);
+          notify(diag.title, 'error');
+          return null;
+        }
+      }
+    }
+  };
+
   // Instructor media actions
-  const startHostCamera = async () => {
+  const startHostCamera = async (preferAudioOnly = false) => {
     if (!isAdmin || !activeClassId) return;
     await stopHostMedia(false, activeClassId);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localHostStreamRef.current = stream;
-      setLocalHostStream(stream);
-      setMediaMode('camera');
-      setHostMicEnabled(true);
-      await updateHostMediaState(activeClassId, 'camera', true);
-      await upsertMyLiveClassPresence(activeClassId, { cameraActive: true, micActive: true });
+    const result = await acquireCameraAndMicStream(preferAudioOnly);
+    if (!result) return;
+
+    localHostStreamRef.current = result.stream;
+    setLocalHostStream(result.stream);
+    setMediaMode('camera');
+    setHostMicEnabled(result.hasAudio);
+    await updateHostMediaState(activeClassId, 'camera', result.hasAudio);
+    await upsertMyLiveClassPresence(activeClassId, {
+      cameraActive: result.hasVideo,
+      micActive: result.hasAudio,
+    });
+
+    if (result.fallbackNotice) {
+      notify(result.fallbackNotice, 'info');
+    } else if (preferAudioOnly) {
+      notify('میکروفن استاد برای پخش زنده صدا متصل شد.', 'success');
+    } else {
       notify('وب‌کم و میکروفن استاد متصل و برای دانش‌آموزان فعال شد.', 'success');
-    } catch {
-      notify('دسترسی به دوربین یا میکروفن در مرورگر مسدود است یا دستگاهی یافت نشد.', 'error');
     }
   };
 
   const startHostScreenShare = async () => {
     if (!isAdmin || !activeClassId) return;
+    setMediaError(null);
+    if (
+      typeof navigator === 'undefined' ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getDisplayMedia !== 'function'
+    ) {
+      const diag = {
+        title: 'اشتراک‌گذاری صفحه در پنجره پیش‌نمایش فعلی غیرفعال است',
+        detail:
+          'برای اشتراک‌گذاری صفحه نمایش، کلاس را با دکمه زیر در یک تب جدید مرورگر باز کنید.',
+        isPermissionIssue: true,
+      };
+      setMediaError(diag);
+      notify(diag.title, 'error');
+      return;
+    }
+
     await stopHostMedia(false, activeClassId);
     try {
       const displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -799,8 +1100,25 @@ export const LiveClassroomView: React.FC = () => {
         micActive: hasAudio,
       });
       notify('اشتراک‌گذاری صفحه نمایش استاد برای دانش‌آموزان فعال شد.', 'success');
-    } catch {
-      notify('اشتراک‌گذاری صفحه توسط استاد لغو شد یا در دسترس نیست.', 'info');
+    } catch (err) {
+      const name =
+        typeof err === 'object' && err !== null && 'name' in err
+          ? String((err as { name?: unknown }).name)
+          : '';
+      const msg =
+        typeof err === 'object' && err !== null && 'message' in err
+          ? String((err as { message?: unknown }).message).toLowerCase()
+          : '';
+      if (msg.includes('permissions policy') || name === 'SecurityError') {
+        setMediaError({
+          title: 'محدودیت آیفریم برای اشتراک‌گذاری صفحه نمایش',
+          detail:
+            'در پنجره پیش‌نمایش توکار، اشتراک صفحه محدود شده است. لطفاً با دکمه زیر صفحه کلاس را در تب جدید مرورگر باز کنید.',
+          isPermissionIssue: true,
+        });
+      } else {
+        notify('اشتراک‌گذاری صفحه توسط استاد لغو شد یا در دسترس نیست.', 'info');
+      }
     }
   };
 
@@ -821,27 +1139,25 @@ export const LiveClassroomView: React.FC = () => {
   };
 
   // Student media actions (strictly require canPublishMedia === true)
-  const startStudentMedia = async () => {
+  const startStudentMedia = async (preferAudioOnly = false) => {
     if (!user || !activeClassId) return;
     if (!myParticipant?.canPublishMedia) {
       notify('تا زمانی که استاد اجازه ندهد امکان باز کردن وب‌کم یا میکروفن وجود ندارد.', 'error');
       return;
     }
     await stopStudentMedia(false, activeClassId);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localStudentStreamRef.current = stream;
-      setLocalStudentStream(stream);
-      setStudentMicEnabled(true);
-      await upsertMyLiveClassPresence(activeClassId, {
-        cameraRequested: false,
-        cameraActive: true,
-        micActive: true,
-      });
-      notify('وب‌کم و میکروفن شما با مجوز استاد فعال شد.', 'success');
-    } catch {
-      notify('دسترسی مرورگر به دوربین یا میکروفن تایید نشد.', 'error');
-    }
+    const result = await acquireCameraAndMicStream(preferAudioOnly);
+    if (!result) return;
+
+    localStudentStreamRef.current = result.stream;
+    setLocalStudentStream(result.stream);
+    setStudentMicEnabled(result.hasAudio);
+    await upsertMyLiveClassPresence(activeClassId, {
+      cameraRequested: false,
+      cameraActive: result.hasVideo,
+      micActive: result.hasAudio,
+    });
+    notify(result.fallbackNotice || 'وب‌کم و میکروفن شما با مجوز استاد فعال شد.', 'success');
   };
 
   const toggleStudentMic = async () => {
@@ -993,7 +1309,9 @@ export const LiveClassroomView: React.FC = () => {
             {activeClass && (
               <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400">
                 مدرس: {activeClass.instructorName} · {activeClass.grade} · {activeClass.courseTitle} ·{' '}
-                {activeClass.scheduledLabel} ·{' '}
+                {formatIranScheduleRange(activeClass.startTimeIso, activeClass.endTimeIso) ||
+                  activeClass.scheduledLabel}{' '}
+                ·{' '}
                 <span className="font-semibold text-slate-800 dark:text-slate-200">
                   {activeClass.isFree ? 'عمومی و رایگان' : 'اختصاصی ثبت‌نام‌شدگان دوره'}
                 </span>
@@ -1086,10 +1404,10 @@ export const LiveClassroomView: React.FC = () => {
             {!user ? (
               <button
                 type="button"
-                onClick={() => void signInWithGoogle()}
+                onClick={openAuthModal}
                 className="px-5 py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold rounded-xl cursor-pointer"
               >
-                ورود با گوگل و بررسی وضعیت ثبت‌نام
+                ورود با شماره تلفن یا گوگل
               </button>
             ) : activeClass.courseId === 'general' ? (
               <button
@@ -1187,14 +1505,24 @@ export const LiveClassroomView: React.FC = () => {
                       )}
 
                       {mediaMode !== 'camera' && (
-                        <button
-                          type="button"
-                          onClick={() => void startHostCamera()}
-                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-semibold rounded-lg cursor-pointer"
-                        >
-                          <Video className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>وب‌کم + میکروفن</span>
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => void startHostCamera(false)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-semibold rounded-lg cursor-pointer"
+                          >
+                            <Video className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>وب‌کم + میکروفن</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void startHostCamera(true)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-semibold rounded-lg cursor-pointer"
+                          >
+                            <Mic className="w-3.5 h-3.5 text-amber-400" />
+                            <span>فقط میکروفن</span>
+                          </button>
+                        </>
                       )}
 
                       {mediaMode !== 'screen' && (
@@ -1256,6 +1584,35 @@ export const LiveClassroomView: React.FC = () => {
                     </>
                   )}
 
+                  <button
+                    type="button"
+                    onClick={() => handleToggleRelayAndReconnect(!forceRelayMode)}
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg cursor-pointer ${
+                      forceRelayMode
+                        ? 'bg-sky-700 hover:bg-sky-600 text-white'
+                        : 'bg-slate-800 hover:bg-slate-700 text-sky-300'
+                    }`}
+                  >
+                    <Wifi className="w-3.5 h-3.5" />
+                    <span>
+                      {forceRelayMode
+                        ? 'رله بین‌شبکه‌ای فعال (TURN)'
+                        : 'حالت رله (اینترنت‌های مختلف)'}
+                    </span>
+                  </button>
+
+                  {(hostBroadcastActive || rtcNetworkStatus !== 'idle') && (
+                    <button
+                      type="button"
+                      onClick={() => handleToggleRelayAndReconnect()}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg cursor-pointer"
+                      aria-label="بازنشانی اتصال تصویر و صدا"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>بازنشانی اتصال</span>
+                    </button>
+                  )}
+
                   {activeClass.streamUrl && (
                     <a
                       href={activeClass.streamUrl}
@@ -1270,22 +1627,115 @@ export const LiveClassroomView: React.FC = () => {
                 </div>
               </div>
 
-              {/* Instructor Live Video / Screen Share Stage */}
+              {hostBroadcastActive && rtcNetworkStatus !== 'idle' && (
+                <div className="px-5 py-2 bg-slate-900/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-300">
+                  <div className="flex items-center gap-2">
+                    <Wifi
+                      className={`w-3.5 h-3.5 ${
+                        rtcNetworkStatus === 'connected'
+                          ? 'text-emerald-400'
+                          : rtcNetworkStatus === 'reconnecting'
+                            ? 'text-amber-400'
+                            : 'text-sky-400'
+                      }`}
+                    />
+                    <span>
+                      وضعیت انتقال بین‌شبکه‌ای:{' '}
+                      <strong className="text-white">
+                        {rtcNetworkStatus === 'connected'
+                          ? forceRelayMode
+                            ? 'متصل از طریق سرور رله (TURN/TLS)'
+                            : 'متصل و پایدار'
+                          : rtcNetworkStatus === 'reconnecting'
+                            ? 'در حال بازنشانی خودکار مسیر شبکه...'
+                            : 'در حال برقراری ارتباط با سرورهای TURN/STUN...'}
+                      </strong>
+                    </span>
+                  </div>
+                  <span className="text-slate-400">
+                    در صورت اختلاف اینترنت یا شبکه موبایل، دکمه «حالت رله (اینترنت‌های مختلف)» را بزنید.
+                  </span>
+                </div>
+              )}
+
+              {/* Actionable Browser / Iframe Permission Diagnostic Banner */}
+              {mediaError && (
+                <div className="p-4 bg-rose-950/70 border-b border-rose-800 text-rose-100 space-y-2.5 text-xs">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2.5">
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div className="space-y-1">
+                        <p className="font-bold text-white">{mediaError.title}</p>
+                        <p className="text-rose-200 leading-relaxed">{mediaError.detail}</p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setMediaError(null)}
+                      className="text-rose-300 hover:text-white font-semibold shrink-0 cursor-pointer"
+                    >
+                      بستن
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pr-6">
+                    {mediaError.isPermissionIssue && typeof window !== 'undefined' && (
+                      <a
+                        href={window.location.href}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>باز کردن کلاس در تب جدید مرورگر (رفع محدودیت آیفریم)</span>
+                      </a>
+                    )}
+                    {isAdmin && (
+                      <button
+                        type="button"
+                        onClick={() => void startHostCamera(true)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold rounded-lg cursor-pointer"
+                      >
+                        <Mic className="w-3.5 h-3.5" />
+                        <span>تلاش با فقط میکروفن</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Instructor Live Video / Audio / Screen Share Stage */}
               {hostBroadcastActive && (
                 <div className="bg-black border-b border-slate-800 relative">
                   {activeHostStream ? (
-                    <StreamVideo
-                      stream={activeHostStream}
-                      muted={isAdmin || remoteHostAudioMuted}
-                      className="w-full max-h-[380px] object-contain mx-auto bg-black"
-                    />
+                    activeHostStream.getVideoTracks().length > 0 ? (
+                      <StreamVideo
+                        stream={activeHostStream}
+                        muted={isAdmin || remoteHostAudioMuted}
+                        className="w-full max-h-[380px] object-contain mx-auto bg-black"
+                      />
+                    ) : (
+                      <div className="py-10 px-6 text-center space-y-2 relative">
+                        <StreamVideo
+                          stream={activeHostStream}
+                          muted={isAdmin || remoteHostAudioMuted}
+                          className="w-px h-px opacity-0 pointer-events-none absolute"
+                        />
+                        <Mic className="w-7 h-7 text-emerald-400 mx-auto" />
+                        <p className="text-sm font-bold text-slate-200">
+                          پخش زنده صوتی (میکروفن استاد) متصل است
+                        </p>
+                        <p className="text-xs text-slate-400">
+                          صدای تدریس استاد هم‌زمان با تخته هوشمند برای دانش‌آموزان پخش می‌شود.
+                        </p>
+                      </div>
+                    )
                   ) : (
                     <div className="py-16 px-6 text-center space-y-2">
                       <Radio className="w-7 h-7 text-emerald-400 mx-auto" />
                       <p className="text-sm font-bold text-slate-200">
                         {activeClass.hostMediaMode === 'screen'
                           ? 'استاد در حال اشتراک‌گذاری صفحه نمایش است'
-                          : 'وب‌کم و میکروفن استاد روشن است'}
+                          : 'استاد در حال پخش زنده تصویر یا صدا است'}
                       </p>
                       <p className="text-xs text-slate-400">
                         {user
@@ -1301,7 +1751,9 @@ export const LiveClassroomView: React.FC = () => {
                       <span className="font-semibold">
                         {(isAdmin ? mediaMode : activeClass.hostMediaMode) === 'screen'
                           ? 'اشتراک‌گذاری صفحه نمایش مدرس'
-                          : 'تصویر زنده وب‌کم مدرس'}
+                          : activeHostStream && activeHostStream.getVideoTracks().length === 0
+                            ? 'پخش صوتی زنده مدرس'
+                            : 'تصویر زنده وب‌کم مدرس'}
                       </span>
                       <span className="text-slate-500">·</span>
                       <span
@@ -1414,14 +1866,24 @@ export const LiveClassroomView: React.FC = () => {
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
                         {!localStudentStream ? (
-                          <button
-                            type="button"
-                            onClick={() => void startStudentMedia()}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer"
-                          >
-                            <Video className="w-3.5 h-3.5" />
-                            <span>روشن کردن وب‌کم و میکروفن من</span>
-                          </button>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => void startStudentMedia(false)}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer"
+                            >
+                              <Video className="w-3.5 h-3.5" />
+                              <span>روشن کردن وب‌کم و میکروفن</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void startStudentMedia(true)}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 cursor-pointer"
+                            >
+                              <Mic className="w-3.5 h-3.5" />
+                              <span>فقط میکروفن</span>
+                            </button>
+                          </div>
                         ) : (
                           <>
                             <button
@@ -1698,11 +2160,11 @@ export const LiveClassroomView: React.FC = () => {
                 {!user ? (
                   <div className="py-10 text-center space-y-3">
                     <p className="text-xs text-slate-600 dark:text-slate-400">
-                      برای مشاهده حاضرین کلاس و ارسال درخواست وب‌کم وارد حساب گوگل شوید.
+                      برای مشاهده حاضرین کلاس و ارسال درخواست وب‌کم با شماره تلفن یا گوگل وارد شوید.
                     </p>
                     <button
                       type="button"
-                      onClick={() => void signInWithGoogle()}
+                      onClick={openAuthModal}
                       className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
                     >
                       ورود به کلاس آنلاین
@@ -1831,11 +2293,11 @@ export const LiveClassroomView: React.FC = () => {
                   {!user ? (
                     <div className="h-full flex flex-col items-center justify-center text-center py-10 space-y-3">
                       <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-                        برای مشاهده پیام‌های کلاس و پرسیدن سوال از استاد، با حساب گوگل خود وارد شوید.
+                        برای مشاهده پیام‌های کلاس و پرسیدن سوال از استاد، با شماره تلفن یا حساب گوگل وارد شوید.
                       </p>
                       <button
                         type="button"
-                        onClick={() => void signInWithGoogle()}
+                        onClick={openAuthModal}
                         className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
                       >
                         ورود به کلاس آنلاین

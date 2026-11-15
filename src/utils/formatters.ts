@@ -3,6 +3,57 @@ export function toPersianDigits(input: number | string): string {
   return String(input).replace(/\d/g, (digit) => persianDigits[Number(digit)] ?? digit);
 }
 
+export function toEnglishDigits(input: string): string {
+  return input
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06f0))
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660));
+}
+
+export function normalizeIranPhone(raw: string): string | null {
+  const digitsOnly = toEnglishDigits(raw).replace(/[\s\-().+]/g, '');
+  let normalized = digitsOnly;
+  if (normalized.startsWith('0098')) {
+    normalized = `0${normalized.slice(4)}`;
+  } else if (normalized.startsWith('98') && normalized.length === 12) {
+    normalized = `0${normalized.slice(2)}`;
+  } else if (normalized.startsWith('9') && normalized.length === 10) {
+    normalized = `0${normalized}`;
+  }
+  return /^09\d{9}$/.test(normalized) ? normalized : null;
+}
+
+export function phoneToSyntheticEmail(normalizedPhone: string): string {
+  return `u${normalizedPhone}@phone.biomaze.ir`;
+}
+
+export function formatIranScheduleRange(startTimeIso?: string, endTimeIso?: string): string {
+  if (!startTimeIso) return '';
+  const startDate = new Date(startTimeIso);
+  if (Number.isNaN(startDate.getTime())) return '';
+
+  const dateStr = new Intl.DateTimeFormat('fa-IR', {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+  }).format(startDate);
+  const startTimeStr = new Intl.DateTimeFormat('fa-IR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(startDate);
+
+  if (endTimeIso) {
+    const endDate = new Date(endTimeIso);
+    if (!Number.isNaN(endDate.getTime())) {
+      const endTimeStr = new Intl.DateTimeFormat('fa-IR', {
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(endDate);
+      return `${dateStr} · ساعت ${startTimeStr} تا ${endTimeStr}`;
+    }
+  }
+  return `${dateStr} · ساعت ${startTimeStr}`;
+}
+
 export function formatToman(amount: number): string {
   if (amount === 0) return 'رایگان';
   return `${toPersianDigits(amount.toLocaleString('en-US'))} تومان`;

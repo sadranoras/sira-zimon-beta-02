@@ -1,6 +1,19 @@
 import React, { useState } from 'react';
-import { ChevronDown, ChevronUp, Edit3, FileText, Film, Plus, Trash2, Upload } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronUp,
+  Clock,
+  Edit3,
+  FileText,
+  Film,
+  Plus,
+  Radio,
+  Trash2,
+  Upload,
+  Video,
+} from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { auth } from '../firebase';
 import { GENERATED_IMAGES } from '../data/seedData';
 import type {
   Course,
@@ -12,17 +25,21 @@ import type {
   GradeLevel,
   QuestionDifficulty,
 } from '../types';
-import { formatToman, toPersianDigits } from '../utils/formatters';
+import { formatIranScheduleRange, formatToman, toPersianDigits } from '../utils/formatters';
+import { uploadCourseMediaFile } from '../utils/media';
 
 export const AdminCoursesTab: React.FC = () => {
   const {
     courses,
     booklets,
+    liveClasses,
     saveCourse,
     deleteCourse,
     fetchCourseLessons,
     saveCourseLesson,
     deleteCourseLesson,
+    saveLiveClass,
+    openLiveClass,
     notify,
   } = useApp();
 
@@ -59,6 +76,17 @@ export const AdminCoursesTab: React.FC = () => {
   const [lessonBookletTitle, setLessonBookletTitle] = useState('');
   const [lessonBookletUrl, setLessonBookletUrl] = useState('');
   const [lessonKeyPoints, setLessonKeyPoints] = useState('');
+  const [uploadingVideoPct, setUploadingVideoPct] = useState<number | null>(null);
+  const [uploadingPdfPct, setUploadingPdfPct] = useState<number | null>(null);
+
+  // Per-course exclusive live class quick creator
+  const [courseLiveFormOpen, setCourseLiveFormOpen] = useState(false);
+  const [liveClassTitle, setLiveClassTitle] = useState('');
+  const [liveStartLocal, setLiveStartLocal] = useState('');
+  const [liveEndLocal, setLiveEndLocal] = useState('');
+  const [liveScheduledLabel, setLiveScheduledLabel] = useState('');
+  const [liveIsExclusive, setLiveIsExclusive] = useState(true);
+  const [savingCourseLive, setSavingCourseLive] = useState(false);
 
   const resetForm = () => {
     setEditingId(null);
@@ -181,6 +209,105 @@ export const AdminCoursesTab: React.FC = () => {
       notify('خواندن فایل متنی امکان‌پذیر نبود.', 'error');
     } finally {
       e.target.value = '';
+    }
+  };
+
+  const handleUploadLessonVideo = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingVideoPct(0);
+    try {
+      const token = (await auth.currentUser?.getIdToken()) || '';
+      const uploaded = await uploadCourseMediaFile(file, 'video', token, (pct) => {
+        setUploadingVideoPct(pct);
+      });
+      setLessonVideoUrl(uploaded.url);
+      if (!lessonTitle.trim()) {
+        setLessonTitle(file.name.replace(/\.(mp4|webm|mov|m4v|mkv|ogg)$/i, ''));
+      }
+      notify('ویدیوی جلسه با موفقیت روی سرور بارگذاری شد.', 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'خطا در بارگذاری فایل ویدیو.', 'error');
+    } finally {
+      setUploadingVideoPct(null);
+      e.target.value = '';
+    }
+  };
+
+  const handleUploadLessonPdf = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingPdfPct(0);
+    try {
+      const token = (await auth.currentUser?.getIdToken()) || '';
+      const uploaded = await uploadCourseMediaFile(file, 'pdf', token, (pct) => {
+        setUploadingPdfPct(pct);
+      });
+      setLessonBookletUrl(uploaded.url);
+      if (!lessonBookletTitle.trim()) {
+        setLessonBookletTitle(file.name.replace(/\.pdf$/i, ''));
+      }
+      notify('فایل PDF جزوه با موفقیت روی سرور بارگذاری شد.', 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'خطا در بارگذاری فایل PDF.', 'error');
+    } finally {
+      setUploadingPdfPct(null);
+      e.target.value = '';
+    }
+  };
+
+  const handleScheduleFieldChange = (nextStart: string, nextEnd: string) => {
+    setLiveStartLocal(nextStart);
+    setLiveEndLocal(nextEnd);
+    const startIso = nextStart ? new Date(nextStart).toISOString() : undefined;
+    const endIso = nextEnd ? new Date(nextEnd).toISOString() : undefined;
+    const autoLabel = formatIranScheduleRange(startIso, endIso);
+    if (autoLabel) {
+      setLiveScheduledLabel(autoLabel);
+    }
+  };
+
+  const handleCreateCourseLiveClass = async (e: React.FormEvent, course: Course) => {
+    e.preventDefault();
+    const startIso = liveStartLocal ? new Date(liveStartLocal).toISOString() : undefined;
+    const endIso = liveEndLocal ? new Date(liveEndLocal).toISOString() : undefined;
+
+    if (startIso && endIso && new Date(endIso).getTime() <= new Date(startIso).getTime()) {
+      notify('ساعت پایان کلاس باید بعد از ساعت شروع باشد.', 'error');
+      return;
+    }
+
+    const finalLabel =
+      liveScheduledLabel.trim() ||
+      formatIranScheduleRange(startIso, endIso) ||
+      'زمان‌بندی آنلاین دوره';
+
+    setSavingCourseLive(true);
+    try {
+      await saveLiveClass({
+        title: liveClassTitle.trim(),
+        courseId: course.id,
+        courseTitle: course.title,
+        instructorName: course.instructor,
+        grade: course.grade,
+        subject: course.category,
+        scheduledLabel: finalLabel,
+        startTimeIso: startIso,
+        endTimeIso: endIso,
+        status: 'scheduled',
+        boardTitle: `تخته زنده: ${liveClassTitle.trim()}`,
+        boardContent: `کلاس آنلاین ${course.title} با تدریس ${course.instructor}`,
+        streamUrl: '',
+        isFree: !liveIsExclusive,
+      });
+      setCourseLiveFormOpen(false);
+      setLiveClassTitle('');
+      setLiveStartLocal('');
+      setLiveEndLocal('');
+      setLiveScheduledLabel('');
+      setLiveIsExclusive(true);
+    } finally {
+      setSavingCourseLive(false);
     }
   };
 
@@ -519,34 +646,78 @@ export const AdminCoursesTab: React.FC = () => {
                         className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-700 rounded-lg"
                       />
 
-                      {/* Offline Video Attachment */}
-                      <div className="p-3.5 bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2">
-                        <label className="flex items-center gap-1.5 text-xs font-bold text-slate-800 dark:text-slate-200">
-                          <Film className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
-                          <span>ویدیوی جلسه آفلاین (لینک MP4، آپارات، یوتیوب یا پخش مستقیم)</span>
-                        </label>
+                      {/* Offline Video Attachment & File Upload */}
+                      <div className="p-3.5 bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-xl space-y-2.5">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <label className="flex items-center gap-1.5 text-xs font-bold text-slate-800 dark:text-slate-200">
+                            <Film className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
+                            <span>ویدیوی جلسه آفلاین (بارگذاری فایل یا لینک مستقیم/آپارات)</span>
+                          </label>
+
+                          <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 text-white rounded-lg cursor-pointer">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>
+                              {uploadingVideoPct !== null
+                                ? `در حال آپلود ویدیو (${toPersianDigits(uploadingVideoPct)}٪)...`
+                                : 'بارگذاری فایل ویدیو (MP4 / WebM / MOV)'}
+                            </span>
+                            <input
+                              type="file"
+                              accept=".mp4,.webm,.mov,.m4v,.mkv,.ogg,video/*"
+                              disabled={uploadingVideoPct !== null}
+                              onChange={(e) => void handleUploadLessonVideo(e)}
+                              className="hidden"
+                            />
+                          </label>
+                        </div>
+
+                        {uploadingVideoPct !== null && (
+                          <div className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-emerald-600 transition-all"
+                              style={{ width: `${uploadingVideoPct}%` }}
+                            />
+                          </div>
+                        )}
+
                         <input
-                          type="url"
+                          type="text"
                           dir="ltr"
                           value={lessonVideoUrl}
                           onChange={(e) => setLessonVideoUrl(e.target.value)}
-                          placeholder="https://example.com/session-01.mp4  or  https://www.aparat.com/v/..."
+                          placeholder="/uploads/video-...mp4  یا لینک آپارات / یوتیوب / MP4"
                           className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 border border-slate-300 dark:border-slate-700 rounded-lg"
                         />
                         <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                          در صورت وارد کردن لینک MP4 یا لینک آپارات/یوتیوب، پلیر اختصاصی ویدیو برای دانش‌آموزان داخل صفحه جلسه فعال می‌شود.
+                          می‌توانید فایل ویدیو را مستقیماً از سیستم بارگذاری کنید یا لینک خارجی/آپارات وارد نمایید.
                         </p>
                       </div>
 
-                      {/* Offline Booklet Attachment */}
+                      {/* Offline Booklet Attachment & PDF Upload */}
                       <div className="p-3.5 bg-slate-50 dark:bg-slate-950/70 border border-slate-200 dark:border-slate-800 rounded-xl space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <label className="flex items-center gap-1.5 text-xs font-bold text-slate-800 dark:text-slate-200">
                             <FileText className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
-                            <span>جزوه و فایل کمک‌آموزشی این جلسه</span>
+                            <span>جزوه و فایل PDF جلسه</span>
                           </label>
 
                           <div className="flex flex-wrap items-center gap-2">
+                            <label className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 text-white rounded-lg cursor-pointer">
+                              <Upload className="w-3.5 h-3.5" />
+                              <span>
+                                {uploadingPdfPct !== null
+                                  ? `در حال آپلود PDF (${toPersianDigits(uploadingPdfPct)}٪)...`
+                                  : 'بارگذاری فایل PDF جزوه'}
+                              </span>
+                              <input
+                                type="file"
+                                accept=".pdf,application/pdf"
+                                disabled={uploadingPdfPct !== null}
+                                onChange={(e) => void handleUploadLessonPdf(e)}
+                                className="hidden"
+                              />
+                            </label>
+
                             <select
                               value=""
                               onChange={(e) => {
@@ -569,7 +740,7 @@ export const AdminCoursesTab: React.FC = () => {
 
                             <label className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border border-slate-300 dark:border-slate-700 rounded-lg hover:border-emerald-600 cursor-pointer">
                               <Upload className="w-3.5 h-3.5" />
-                              <span>درون‌ریزی فایل متنی (.txt)</span>
+                              <span>درون‌ریزی متن (.txt)</span>
                               <input
                                 type="file"
                                 accept=".txt,.md,text/plain"
@@ -580,6 +751,15 @@ export const AdminCoursesTab: React.FC = () => {
                           </div>
                         </div>
 
+                        {uploadingPdfPct !== null && (
+                          <div className="w-full h-1.5 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-emerald-600 transition-all"
+                              style={{ width: `${uploadingPdfPct}%` }}
+                            />
+                          </div>
+                        )}
+
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                           <input
                             type="text"
@@ -589,11 +769,11 @@ export const AdminCoursesTab: React.FC = () => {
                             className="px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-700 rounded-lg"
                           />
                           <input
-                            type="url"
+                            type="text"
                             dir="ltr"
                             value={lessonBookletUrl}
                             onChange={(e) => setLessonBookletUrl(e.target.value)}
-                            placeholder="https://example.com/booklet-01.pdf  (لینک فایل PDF)"
+                            placeholder="/uploads/pdf-...pdf  یا لینک فایل PDF"
                             className="px-3 py-2 text-sm bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 border border-slate-300 dark:border-slate-700 rounded-lg"
                           />
                         </div>
@@ -664,6 +844,156 @@ export const AdminCoursesTab: React.FC = () => {
                         </div>
                       </div>
                     ))}
+                  </div>
+
+                  {/* Course-Exclusive Live Online Classes Section */}
+                  <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <h4 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                        <Radio className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
+                        <span>
+                          کلاس‌های آنلاین اختصاصی این دوره (
+                          {toPersianDigits(
+                            liveClasses.filter((lc) => lc.courseId === course.id).length
+                          )}
+                          )
+                        </span>
+                      </h4>
+
+                      <button
+                        type="button"
+                        onClick={() => setCourseLiveFormOpen((v) => !v)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>
+                          {courseLiveFormOpen ? 'بستن فرم کلاس آنلاین' : 'ایجاد کلاس آنلاین اختصاصی'}
+                        </span>
+                      </button>
+                    </div>
+
+                    {courseLiveFormOpen && (
+                      <form
+                        onSubmit={(e) => void handleCreateCourseLiveClass(e, course)}
+                        className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 space-y-3"
+                      >
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div className="space-y-1">
+                            <label className="text-xs font-medium text-slate-600 dark:text-slate-400">
+                              عنوان کلاس آنلاین اختصاصی
+                            </label>
+                            <input
+                              type="text"
+                              required
+                              value={liveClassTitle}
+                              onChange={(e) => setLiveClassTitle(e.target.value)}
+                              placeholder={`مثلاً: رفع اشکال و کارگاه تست ${course.title}`}
+                              className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-700 rounded-lg"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="text-xs font-medium text-slate-600 dark:text-slate-400">
+                              برچسب متنی زمان برگزاری (خودکار یا دستی)
+                            </label>
+                            <input
+                              type="text"
+                              value={liveScheduledLabel}
+                              onChange={(e) => setLiveScheduledLabel(e.target.value)}
+                              placeholder="پنج‌شنبه ساعت ۱۷:۰۰ تا ۱۹:۰۰"
+                              className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-700 rounded-lg"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-400">
+                              <Clock className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>تاریخ و ساعت شروع</span>
+                            </label>
+                            <input
+                              type="datetime-local"
+                              required
+                              dir="ltr"
+                              value={liveStartLocal}
+                              onChange={(e) =>
+                                handleScheduleFieldChange(e.target.value, liveEndLocal)
+                              }
+                              className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-700 rounded-lg"
+                            />
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-400">
+                              <Clock className="w-3.5 h-3.5 text-rose-500" />
+                              <span>تاریخ و ساعت پایان</span>
+                            </label>
+                            <input
+                              type="datetime-local"
+                              required
+                              dir="ltr"
+                              value={liveEndLocal}
+                              onChange={(e) =>
+                                handleScheduleFieldChange(liveStartLocal, e.target.value)
+                              }
+                              className="w-full px-3 py-2 text-sm bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100 border border-slate-300 dark:border-slate-700 rounded-lg"
+                            />
+                          </div>
+                        </div>
+
+                        <label className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={liveIsExclusive}
+                            onChange={(e) => setLiveIsExclusive(e.target.checked)}
+                          />
+                          <span>
+                            فقط برای ثبت‌نام‌شدگان این دوره و اشتراک الماس (کلاس اختصاصی دوره)
+                          </span>
+                        </label>
+
+                        <button
+                          type="submit"
+                          disabled={savingCourseLive}
+                          className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                        >
+                          {savingCourseLive
+                            ? 'در حال ثبت...'
+                            : 'ثبت کلاس آنلاین اختصاصی دوره'}
+                        </button>
+                      </form>
+                    )}
+
+                    {liveClasses.filter((lc) => lc.courseId === course.id).length > 0 && (
+                      <div className="divide-y divide-slate-200 dark:divide-slate-800 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl">
+                        {liveClasses
+                          .filter((lc) => lc.courseId === course.id)
+                          .map((lc) => (
+                            <div
+                              key={lc.id}
+                              className="p-3.5 flex flex-wrap items-center justify-between gap-3"
+                            >
+                              <div className="space-y-0.5 text-xs">
+                                <p className="font-bold text-slate-900 dark:text-white">
+                                  {lc.title}
+                                </p>
+                                <p className="text-slate-500 dark:text-slate-400">
+                                  {formatIranScheduleRange(lc.startTimeIso, lc.endTimeIso) ||
+                                    lc.scheduledLabel}{' '}
+                                  · {lc.isFree ? 'عمومی' : 'اختصاصی دوره'}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => openLiveClass(lc.id)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                              >
+                                <Video className="w-3.5 h-3.5" />
+                                <span>ورود به کلاس</span>
+                              </button>
+                            </div>
+                          ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}

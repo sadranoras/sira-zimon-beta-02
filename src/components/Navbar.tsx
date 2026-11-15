@@ -13,7 +13,7 @@ export const Navbar: React.FC = () => {
     theme,
     toggleTheme,
     unreadNotificationsCount,
-    signInWithGoogle,
+    openAuthModal,
   } = useApp();
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -35,7 +35,7 @@ export const Navbar: React.FC = () => {
   const handlePrimaryCta = () => {
     setMobileMenuOpen(false);
     if (!user) {
-      void signInWithGoogle();
+      openAuthModal();
     } else if (isAdmin) {
       setView('admin-panel');
     } else {

@@ -1,8 +1,16 @@
 import React, { useState } from 'react';
-import { Edit2, Play, Plus, Radio, Square, Trash2, Video } from 'lucide-react';
+import { Clock, Edit2, Play, Plus, Radio, Square, Trash2, Video } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import type { GradeLevel, LiveClass, LiveClassStatus } from '../types';
-import { toPersianDigits } from '../utils/formatters';
+import { formatIranScheduleRange, toPersianDigits } from '../utils/formatters';
+
+function isoToLocalDatetimeValue(iso?: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
 
 export const AdminLiveClassesTab: React.FC = () => {
   const {
@@ -12,6 +20,7 @@ export const AdminLiveClassesTab: React.FC = () => {
     setLiveClassStatus,
     deleteLiveClass,
     openLiveClass,
+    notify,
   } = useApp();
 
   const [showForm, setShowForm] = useState(false);
@@ -22,6 +31,8 @@ export const AdminLiveClassesTab: React.FC = () => {
   const [grade, setGrade] = useState<GradeLevel>('جامع کنکور');
   const [subject, setSubject] = useState('زیست‌شناسی');
   const [scheduledLabel, setScheduledLabel] = useState('چهارشنبه ساعت ۱۸:۳۰');
+  const [startLocal, setStartLocal] = useState('');
+  const [endLocal, setEndLocal] = useState('');
   const [status, setStatus] = useState<LiveClassStatus>('scheduled');
   const [boardTitle, setBoardTitle] = useState('خلاصه نکات کلیدی جلسه');
   const [boardContent, setBoardContent] = useState('');
@@ -37,6 +48,8 @@ export const AdminLiveClassesTab: React.FC = () => {
     setGrade('جامع کنکور');
     setSubject('زیست‌شناسی');
     setScheduledLabel('چهارشنبه ساعت ۱۸:۳۰');
+    setStartLocal('');
+    setEndLocal('');
     setStatus('scheduled');
     setBoardTitle('خلاصه نکات کلیدی جلسه');
     setBoardContent('');
@@ -52,6 +65,8 @@ export const AdminLiveClassesTab: React.FC = () => {
     setGrade(lc.grade);
     setSubject(lc.subject);
     setScheduledLabel(lc.scheduledLabel);
+    setStartLocal(isoToLocalDatetimeValue(lc.startTimeIso));
+    setEndLocal(isoToLocalDatetimeValue(lc.endTimeIso));
     setStatus(lc.status);
     setBoardTitle(lc.boardTitle);
     setBoardContent(lc.boardContent);
@@ -60,8 +75,36 @@ export const AdminLiveClassesTab: React.FC = () => {
     setShowForm(true);
   };
 
+  const handleTimeRangeChange = (nextStart: string, nextEnd: string) => {
+    setStartLocal(nextStart);
+    setEndLocal(nextEnd);
+    const startIso = nextStart ? new Date(nextStart).toISOString() : undefined;
+    const endIso = nextEnd ? new Date(nextEnd).toISOString() : undefined;
+    const autoLabel = formatIranScheduleRange(startIso, endIso);
+    if (autoLabel) {
+      setScheduledLabel(autoLabel);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    const startTimeIso = startLocal ? new Date(startLocal).toISOString() : undefined;
+    const endTimeIso = endLocal ? new Date(endLocal).toISOString() : undefined;
+
+    if (
+      startTimeIso &&
+      endTimeIso &&
+      new Date(endTimeIso).getTime() <= new Date(startTimeIso).getTime()
+    ) {
+      notify('ساعت پایان کلاس باید بعد از ساعت شروع باشد.', 'error');
+      return;
+    }
+
+    const finalScheduleLabel =
+      scheduledLabel.trim() ||
+      formatIranScheduleRange(startTimeIso, endTimeIso) ||
+      'زمان‌بندی آنلاین';
+
     setSaving(true);
     try {
       const matchedCourse = courses.find((c) => c.id === courseId);
@@ -73,7 +116,9 @@ export const AdminLiveClassesTab: React.FC = () => {
           instructorName,
           grade,
           subject,
-          scheduledLabel,
+          scheduledLabel: finalScheduleLabel,
+          startTimeIso,
+          endTimeIso,
           status,
           boardTitle,
           boardContent,
@@ -188,14 +233,42 @@ export const AdminLiveClassesTab: React.FC = () => {
 
             <div className="space-y-1">
               <label className="text-xs font-medium text-slate-600 dark:text-slate-400">
-                زمان برگزاری
+                برچسب نمایشی زمان برگزاری
               </label>
               <input
                 type="text"
                 required
                 value={scheduledLabel}
                 onChange={(e) => setScheduledLabel(e.target.value)}
-                placeholder="پنج‌شنبه ساعت ۱۷:۰۰"
+                placeholder="پنج‌شنبه ساعت ۱۷:۰۰ تا ۱۹:۰۰"
+                className="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-400">
+                <Clock className="w-3.5 h-3.5 text-emerald-600" />
+                <span>تاریخ و ساعت شروع (اختیاری / توصیه‌شده)</span>
+              </label>
+              <input
+                type="datetime-local"
+                dir="ltr"
+                value={startLocal}
+                onChange={(e) => handleTimeRangeChange(e.target.value, endLocal)}
+                className="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
+              />
+            </div>
+
+            <div className="space-y-1">
+              <label className="flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-400">
+                <Clock className="w-3.5 h-3.5 text-rose-500" />
+                <span>تاریخ و ساعت پایان</span>
+              </label>
+              <input
+                type="datetime-local"
+                dir="ltr"
+                value={endLocal}
+                onChange={(e) => handleTimeRangeChange(startLocal, e.target.value)}
                 className="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
               />
             </div>
@@ -338,7 +411,9 @@ export const AdminLiveClassesTab: React.FC = () => {
                   <span className="text-slate-300 dark:text-slate-700">·</span>
                   <span className="text-slate-500 dark:text-slate-400">{lc.grade}</span>
                   <span className="text-slate-300 dark:text-slate-700">·</span>
-                  <span className="text-slate-500 dark:text-slate-400">{lc.scheduledLabel}</span>
+                  <span className="text-slate-500 dark:text-slate-400">
+                    {formatIranScheduleRange(lc.startTimeIso, lc.endTimeIso) || lc.scheduledLabel}
+                  </span>
                   <span className="text-slate-300 dark:text-slate-700">·</span>
                   <span className={lc.isFree ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}>
                     {lc.isFree ? 'عمومی / رایگان' : 'اختصاصی ثبت‌نام‌شدگان دوره'}

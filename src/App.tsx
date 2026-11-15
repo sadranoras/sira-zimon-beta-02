@@ -17,6 +17,7 @@ import { LiveClassroomView } from './components/LiveClassroomView';
 import { StudentPanelView } from './components/StudentPanelView';
 import { AdminPanelView } from './components/AdminPanelView';
 import { CartDrawer } from './components/CartDrawer';
+import { AuthModal } from './components/AuthModal';
 import { ToastContainer } from './components/ToastContainer';
 import { Footer } from './components/Footer';
 
@@ -58,6 +59,7 @@ const AppShell: React.FC = () => {
       <main className="flex-1">{renderView()}</main>
       <Footer />
       <CartDrawer />
+      <AuthModal />
       <ToastContainer />
     </div>
   );

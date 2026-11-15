@@ -1,8 +1,11 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
+  createUserWithEmailAndPassword,
   onAuthStateChanged,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut as firebaseSignOut,
+  updateProfile,
   type User,
 } from 'firebase/auth';
 import {
@@ -72,7 +75,7 @@ import type {
   UserNotificationState,
   UserProfile,
 } from '../types';
-import { slugifySafeId } from '../utils/formatters';
+import { normalizeIranPhone, phoneToSyntheticEmail, slugifySafeId } from '../utils/formatters';
 import { analyzeKonkurResult, getBenchmarkForDifficulty } from '../utils/konkurAnalytics';
 
 interface ToastMessage {
@@ -137,7 +140,19 @@ interface AppContextValue {
   checkoutCart: () => Promise<boolean>;
 
   // Auth & Profile
+  isAuthModalOpen: boolean;
+  setIsAuthModalOpen: (open: boolean) => void;
+  openAuthModal: () => void;
   signInWithGoogle: () => Promise<void>;
+  signInWithPhonePassword: (
+    phone: string,
+    password: string
+  ) => Promise<{ ok: boolean; error?: string }>;
+  registerWithPhonePassword: (
+    displayName: string,
+    phone: string,
+    password: string
+  ) => Promise<{ ok: boolean; error?: string }>;
   signOut: () => Promise<void>;
   updateMyProfile: (displayName: string, grade: StudentGrade, field: StudyField) => Promise<void>;
 
@@ -235,6 +250,8 @@ interface AppContextValue {
       grade: GradeLevel;
       subject: string;
       scheduledLabel: string;
+      startTimeIso?: string;
+      endTimeIso?: string;
       status: LiveClassStatus;
       boardTitle: string;
       boardContent: string;
@@ -382,6 +399,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   });
   const [isCartOpen, setIsCartOpen] = useState(false);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const notify = useCallback((text: string, type: 'success' | 'error' | 'info' = 'info') => {
@@ -546,10 +564,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const userRef = doc(db, 'users', currentUser.uid);
         const snap = await getDoc(userRef);
         if (!snap.exists()) {
+          const phoneMatch = currentUser.email?.match(/^u(09\d{9})@phone\.biomaze\.ir$/i);
+          const extractedPhone = phoneMatch ? phoneMatch[1] : undefined;
           const newProfile: UserProfile = {
             uid: currentUser.uid,
             displayName: currentUser.displayName || 'دانش‌آموز ماز',
             email: currentUser.email || '',
+            ...(extractedPhone ? { phone: extractedPhone } : {}),
             grade: 'دوازدهم',
             field: 'علوم تجربی',
             diamondActive: false,
@@ -1053,15 +1074,115 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
 
+  const openAuthModal = useCallback(() => {
+    setIsAuthModalOpen(true);
+  }, []);
+
   const signInWithGoogle = useCallback(async () => {
     try {
       await signInWithPopup(auth, googleProvider);
+      setIsAuthModalOpen(false);
       notify('ورود به حساب کاربری با موفقیت انجام شد.', 'success');
     } catch (err) {
       console.error(err);
       notify('ورود با حساب گوگل انجام نشد. لطفاً دوباره تلاش کنید.', 'error');
     }
   }, [notify]);
+
+  const mapAuthErrorMessage = (err: unknown): string => {
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code?: unknown }).code)
+        : '';
+    switch (code) {
+      case 'auth/operation-not-allowed':
+        return 'ورود با شماره تلفن و رمز عبور (Email/Password) هنوز در پنل Firebase Authentication پروژه فعال نشده است. از کنسول فایربیس گزینه Email/Password را Enable کنید.';
+      case 'auth/invalid-credential':
+      case 'auth/wrong-password':
+      case 'auth/user-not-found':
+        return 'شماره موبایل یا رمز عبور نادرست است.';
+      case 'auth/email-already-in-use':
+        return 'این شماره موبایل قبلاً ثبت‌نام شده است. از تب ورود وارد شوید.';
+      case 'auth/weak-password':
+        return 'رمز عبور باید حداقل ۶ کاراکتر باشد.';
+      case 'auth/too-many-requests':
+        return 'تعداد تلاش‌های ناموفق زیاد بود. لطفاً چند دقیقه دیگر تلاش کنید.';
+      default:
+        return 'خطا در برقراری ارتباط با سرویس احراز هویت. لطفاً دوباره تلاش کنید.';
+    }
+  };
+
+  const signInWithPhonePassword = useCallback(
+    async (phone: string, password: string): Promise<{ ok: boolean; error?: string }> => {
+      const normalized = normalizeIranPhone(phone);
+      if (!normalized) {
+        return { ok: false, error: 'لطفاً شماره موبایل معتبر با فرمت ۰۹۱۲۳۴۵۶۷۸۹ وارد کنید.' };
+      }
+      if (!password || password.length < 6) {
+        return { ok: false, error: 'رمز عبور باید حداقل ۶ کاراکتر باشد.' };
+      }
+      try {
+        const syntheticEmail = phoneToSyntheticEmail(normalized);
+        await signInWithEmailAndPassword(auth, syntheticEmail, password);
+        setIsAuthModalOpen(false);
+        notify('با موفقیت وارد حساب کاربری خود شدید.', 'success');
+        return { ok: true };
+      } catch (err) {
+        console.error('Phone sign-in error:', err);
+        return { ok: false, error: mapAuthErrorMessage(err) };
+      }
+    },
+    [notify]
+  );
+
+  const registerWithPhonePassword = useCallback(
+    async (
+      displayName: string,
+      phone: string,
+      password: string
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const cleanName = displayName.trim();
+      if (cleanName.length < 2) {
+        return { ok: false, error: 'لطفاً نام و نام خانوادگی خود را وارد کنید.' };
+      }
+      const normalized = normalizeIranPhone(phone);
+      if (!normalized) {
+        return { ok: false, error: 'شماره موبایل معتبر با شروع ۰۹ وارد کنید.' };
+      }
+      if (!password || password.length < 6) {
+        return { ok: false, error: 'رمز عبور باید حداقل ۶ کاراکتر باشد.' };
+      }
+      try {
+        const syntheticEmail = phoneToSyntheticEmail(normalized);
+        const cred = await createUserWithEmailAndPassword(auth, syntheticEmail, password);
+        await updateProfile(cred.user, { displayName: cleanName });
+
+        // Explicitly create/ensure profile with student's displayName and normalized phone
+        const profilePayload: UserProfile = {
+          uid: cred.user.uid,
+          displayName: cleanName,
+          email: syntheticEmail,
+          phone: normalized,
+          grade: 'دوازدهم',
+          field: 'علوم تجربی',
+          diamondActive: false,
+        };
+        await setDoc(doc(db, 'users', cred.user.uid), {
+          ...profilePayload,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        setUserProfile(profilePayload);
+        setIsAuthModalOpen(false);
+        notify('ثبت‌نام با شماره موبایل با موفقیت انجام شد.', 'success');
+        return { ok: true };
+      } catch (err) {
+        console.error('Phone register error:', err);
+        return { ok: false, error: mapAuthErrorMessage(err) };
+      }
+    },
+    [notify]
+  );
 
   const signOut = useCallback(async () => {
     await firebaseSignOut(auth);
@@ -1299,8 +1420,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const checkoutCart = useCallback(async (): Promise<boolean> => {
     if (cart.length === 0) return false;
     if (!user) {
-      notify('برای تکمیل ثبت‌نام و فعال‌سازی دوره‌ها ابتدا وارد حساب گوگل خود شوید.', 'info');
-      await signInWithGoogle();
+      notify('برای تکمیل ثبت‌نام و فعال‌سازی دوره‌ها ابتدا وارد حساب کاربری خود شوید.', 'info');
+      setIsAuthModalOpen(true);
       return false;
     }
 
@@ -1348,7 +1469,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `orders/${orderId}`);
     }
-  }, [cart, user, userProfile, notify, signInWithGoogle]);
+  }, [cart, user, userProfile, notify]);
 
   // --- Admin CRUD Handlers ---
   const saveCourse = useCallback(
@@ -2104,6 +2225,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         grade: GradeLevel;
         subject: string;
         scheduledLabel: string;
+        startTimeIso?: string;
+        endTimeIso?: string;
         status: LiveClassStatus;
         boardTitle: string;
         boardContent: string;
@@ -2149,7 +2272,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
         const snap = await getDoc(ref);
         const existingData = snap.exists() ? snap.data() : null;
-        const data = {
+        const cleanStart = (payload.startTimeIso || '').trim().slice(0, 60);
+        const cleanEnd = (payload.endTimeIso || '').trim().slice(0, 60);
+
+        const data: Record<string, unknown> = {
           title: payload.title.trim(),
           courseId: payload.courseId || 'general',
           courseTitle: payload.courseTitle.trim() || 'کلاس آنلاین مستقل',
@@ -2168,6 +2294,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           hostUid: existingData?.hostUid || '',
           updatedAt: serverTimestamp(),
         };
+        if (cleanStart) {
+          data.startTimeIso = cleanStart;
+        }
+        if (cleanEnd) {
+          data.endTimeIso = cleanEnd;
+        }
 
         if (snap.exists()) {
           await setDoc(ref, {
@@ -2710,7 +2842,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         removeFromCart,
         clearCart,
         checkoutCart,
+        isAuthModalOpen,
+        setIsAuthModalOpen,
+        openAuthModal,
         signInWithGoogle,
+        signInWithPhonePassword,
+        registerWithPhonePassword,
         signOut,
         updateMyProfile,
         fetchCourseLessons,

@@ -923,7 +923,7 @@ export const AdminPanelView: React.FC = () => {
                                 {u.displayName}
                               </p>
                               <p className="text-xs text-slate-500 dark:text-slate-400 font-mono-tabular">
-                                {u.email}
+                                {u.phone || u.email}
                               </p>
                             </td>
                             <td className="py-3.5 px-4 text-xs text-slate-700 dark:text-slate-300">

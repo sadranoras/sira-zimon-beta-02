@@ -14,7 +14,7 @@ import {
 import { useApp } from '../context/AppContext';
 import { GENERATED_IMAGES } from '../data/seedData';
 import type { CourseLesson } from '../types';
-import { formatToman, toPersianDigits } from '../utils/formatters';
+import { formatIranScheduleRange, formatToman, toPersianDigits } from '../utils/formatters';
 import { downloadOfflineLessonBooklet, resolveLessonVideoSource } from '../utils/media';
 import { ResilientImage } from './ResilientImage';
 
@@ -126,7 +126,8 @@ export const CourseDetailView: React.FC = () => {
                     {lc.title}
                   </p>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                    {lc.scheduledLabel} · {lc.isFree ? 'عمومی' : 'اختصاصی ثبت‌نام‌شدگان'}
+                    {formatIranScheduleRange(lc.startTimeIso, lc.endTimeIso) || lc.scheduledLabel} ·{' '}
+                    {lc.isFree ? 'عمومی' : 'اختصاصی ثبت‌نام‌شدگان'}
                   </p>
                 </div>
                 <button
@@ -456,15 +457,25 @@ export const CourseDetailView: React.FC = () => {
 
                         <div className="flex flex-wrap items-center gap-2.5">
                           {activeLesson.bookletUrl && (
-                            <a
-                              href={activeLesson.bookletUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg"
-                            >
-                              <ExternalLink className="w-3.5 h-3.5" />
-                              <span>دریافت فایل PDF جزوه</span>
-                            </a>
+                            <>
+                              <a
+                                href={activeLesson.bookletUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-700 hover:bg-emerald-800 dark:bg-emerald-600 dark:hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg"
+                              >
+                                <ExternalLink className="w-3.5 h-3.5" />
+                                <span>مشاهده فایل PDF جزوه</span>
+                              </a>
+                              <a
+                                href={activeLesson.bookletUrl}
+                                download={`${resolvedBookletTitle}.pdf`}
+                                className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 dark:hover:bg-slate-700 text-white text-xs font-semibold rounded-lg"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>دانلود مستقیم PDF</span>
+                              </a>
+                            </>
                           )}
 
                           <button

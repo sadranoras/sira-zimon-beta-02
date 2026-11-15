@@ -10,6 +10,7 @@ export interface UserProfile {
   uid: string;
   displayName: string;
   email: string;
+  phone?: string;
   grade: StudentGrade;
   field: StudyField;
   diamondActive: boolean;
@@ -253,6 +254,8 @@ export interface LiveClass {
   grade: GradeLevel;
   subject: string;
   scheduledLabel: string;
+  startTimeIso?: string;
+  endTimeIso?: string;
   status: LiveClassStatus;
   boardTitle: string;
   boardContent: string;

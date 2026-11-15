@@ -10,7 +10,7 @@ export function resolveLessonVideoSource(rawUrl?: string): ResolvedVideoSource |
 
   // Direct video stream or file
   if (
-    /\.(mp4|webm|ogg|m4v)(\?.*)?$/i.test(url) ||
+    /\.(mp4|webm|ogg|m4v|mov|mkv)(\?.*)?$/i.test(url) ||
     url.startsWith('blob:') ||
     url.startsWith('data:video/')
   ) {
@@ -154,4 +154,56 @@ export function downloadOfflineLessonBooklet(params: {
   link.click();
   document.body.removeChild(link);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function uploadCourseMediaFile(
+  file: File,
+  kind: 'video' | 'pdf',
+  idToken: string,
+  onProgress?: (percent: number) => void
+): Promise<{ url: string; fileName: string; bytes: number }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const qs = new URLSearchParams({
+      kind,
+      filename: file.name || (kind === 'pdf' ? 'booklet.pdf' : 'lesson.mp4'),
+    });
+    xhr.open('POST', `/api/upload?${qs.toString()}`);
+    if (idToken) {
+      xhr.setRequestHeader('Authorization', `Bearer ${idToken}`);
+    }
+    xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && onProgress) {
+        onProgress(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const parsed = JSON.parse(xhr.responseText) as {
+            url: string;
+            fileName: string;
+            bytes: number;
+          };
+          onProgress?.(100);
+          resolve(parsed);
+        } catch {
+          reject(new Error('پاسخ نامعتبر از سرور بارگذاری'));
+        }
+      } else {
+        try {
+          const errJson = JSON.parse(xhr.responseText) as { error?: string };
+          reject(new Error(errJson.error || `خطا در بارگذاری فایل (کد ${xhr.status})`));
+        } catch {
+          reject(new Error(`خطا در بارگذاری فایل (کد ${xhr.status})`));
+        }
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('خطای شبکه هنگام ارسال فایل به سرور'));
+    xhr.send(file);
+  });
 }
