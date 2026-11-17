@@ -311,8 +311,8 @@ service cloud.firestore {
         && data.keys().hasOnly(['fromUid', 'toUid', 'type', 'payload', 'createdAt'])
         && data.fromUid is string && isValidId(data.fromUid)
         && data.toUid is string && isValidId(data.toUid)
-        && data.type in ['offer', 'answer', 'ice']
-        && data.payload is string && data.payload.size() >= 2 && data.payload.size() <= 12000
+        && data.type in ['offer', 'answer', 'ice', 'hello']
+        && data.payload is string && data.payload.size() >= 2 && data.payload.size() <= 32000
         && data.createdAt is timestamp;
     }
 

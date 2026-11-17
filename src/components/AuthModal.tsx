@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { Eye, EyeOff, Lock, Phone, User, X } from 'lucide-react';
+import { ExternalLink, Eye, EyeOff, Lock, Phone, User, X } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import firebaseConfig from '../../firebase-applet-config.json';
 
 export const AuthModal: React.FC = () => {
   const {
@@ -18,12 +19,16 @@ export const AuthModal: React.FC = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [errorCode, setErrorCode] = useState('');
 
   if (!isAuthModalOpen) return null;
+
+  const firebaseProvidersUrl = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/providers`;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
+    setErrorCode('');
     setSubmitting(true);
     try {
       const res =
@@ -32,6 +37,7 @@ export const AuthModal: React.FC = () => {
           : await registerWithPhonePassword(displayName, phone, password);
       if (!res.ok && res.error) {
         setErrorMsg(res.error);
+        setErrorCode(res.errorCode || '');
       } else {
         setDisplayName('');
         setPhone('');
@@ -78,6 +84,7 @@ export const AuthModal: React.FC = () => {
               onClick={() => {
                 setMode('login');
                 setErrorMsg('');
+                setErrorCode('');
               }}
               className={`py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
                 mode === 'login'
@@ -92,6 +99,7 @@ export const AuthModal: React.FC = () => {
               onClick={() => {
                 setMode('register');
                 setErrorMsg('');
+                setErrorCode('');
               }}
               className={`py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
                 mode === 'register'
@@ -169,8 +177,29 @@ export const AuthModal: React.FC = () => {
             </div>
 
             {errorMsg && (
-              <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 text-xs text-rose-700 dark:text-rose-300 leading-relaxed">
-                {errorMsg}
+              <div className="p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900 text-xs text-rose-700 dark:text-rose-300 leading-relaxed space-y-2.5">
+                <p>{errorMsg}</p>
+                {errorCode === 'auth/operation-not-allowed' && (
+                  <div className="pt-2 border-t border-rose-200 dark:border-rose-800/80 space-y-2 text-slate-700 dark:text-slate-300">
+                    <p className="font-semibold text-slate-900 dark:text-white">
+                      راهنمای فعال‌سازی در کمتر از ۳۰ ثانیه:
+                    </p>
+                    <ol className="list-decimal list-inside space-y-1 text-[11px]">
+                      <li>دکمه زیر را بزنید تا صفحه Sign-in method پروژه باز شود.</li>
+                      <li>روی <strong>Add new provider</strong> (یا Email/Password) کلیک کنید.</li>
+                      <li>گزینه اول (<strong>Email/Password</strong>) را Enable و سپس <strong>Save</strong> کنید.</li>
+                    </ol>
+                    <a
+                      href={firebaseProvidersUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 dark:bg-emerald-600 hover:bg-slate-800 dark:hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>باز کردن تنظیمات Sign-in method در کنسول فایربیس</span>
+                    </a>
+                  </div>
+                )}
               </div>
             )}
 

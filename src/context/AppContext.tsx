@@ -147,12 +147,12 @@ interface AppContextValue {
   signInWithPhonePassword: (
     phone: string,
     password: string
-  ) => Promise<{ ok: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; error?: string; errorCode?: string }>;
   registerWithPhonePassword: (
     displayName: string,
     phone: string,
     password: string
-  ) => Promise<{ ok: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; error?: string; errorCode?: string }>;
   signOut: () => Promise<void>;
   updateMyProfile: (displayName: string, grade: StudentGrade, field: StudyField) => Promise<void>;
 
@@ -318,7 +318,7 @@ interface AppContextValue {
   sendLiveClassSignal: (
     classId: string,
     toUid: string,
-    type: 'offer' | 'answer' | 'ice',
+    type: 'offer' | 'answer' | 'ice' | 'hello',
     payload: string
   ) => Promise<void>;
   consumeLiveClassSignal: (classId: string, signalId: string) => Promise<void>;
@@ -1089,11 +1089,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, [notify]);
 
+  const getAuthErrorCode = (err: unknown): string =>
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code?: unknown }).code)
+      : '';
+
   const mapAuthErrorMessage = (err: unknown): string => {
-    const code =
-      typeof err === 'object' && err !== null && 'code' in err
-        ? String((err as { code?: unknown }).code)
-        : '';
+    const code = getAuthErrorCode(err);
     switch (code) {
       case 'auth/operation-not-allowed':
         return 'ورود با شماره تلفن و رمز عبور (Email/Password) هنوز در پنل Firebase Authentication پروژه فعال نشده است. از کنسول فایربیس گزینه Email/Password را Enable کنید.';
@@ -1113,7 +1115,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const signInWithPhonePassword = useCallback(
-    async (phone: string, password: string): Promise<{ ok: boolean; error?: string }> => {
+    async (
+      phone: string,
+      password: string
+    ): Promise<{ ok: boolean; error?: string; errorCode?: string }> => {
       const normalized = normalizeIranPhone(phone);
       if (!normalized) {
         return { ok: false, error: 'لطفاً شماره موبایل معتبر با فرمت ۰۹۱۲۳۴۵۶۷۸۹ وارد کنید.' };
@@ -1129,7 +1134,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return { ok: true };
       } catch (err) {
         console.error('Phone sign-in error:', err);
-        return { ok: false, error: mapAuthErrorMessage(err) };
+        return {
+          ok: false,
+          error: mapAuthErrorMessage(err),
+          errorCode: getAuthErrorCode(err),
+        };
       }
     },
     [notify]
@@ -1140,7 +1149,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       displayName: string,
       phone: string,
       password: string
-    ): Promise<{ ok: boolean; error?: string }> => {
+    ): Promise<{ ok: boolean; error?: string; errorCode?: string }> => {
       const cleanName = displayName.trim();
       if (cleanName.length < 2) {
         return { ok: false, error: 'لطفاً نام و نام خانوادگی خود را وارد کنید.' };
@@ -1178,7 +1187,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         return { ok: true };
       } catch (err) {
         console.error('Phone register error:', err);
-        return { ok: false, error: mapAuthErrorMessage(err) };
+        return {
+          ok: false,
+          error: mapAuthErrorMessage(err),
+          errorCode: getAuthErrorCode(err),
+        };
       }
     },
     [notify]
@@ -2708,12 +2721,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return onSnapshot(
         q,
         (snap) => {
-          callback(
-            snap.docs.map((d) => ({
-              id: d.id,
-              ...(d.data() as Omit<LiveClassSignal, 'id'>),
-            }))
-          );
+          const list = snap.docs.map((d) => {
+            const raw = d.data() as Omit<LiveClassSignal, 'id'> & {
+              createdAt?: { toMillis?: () => number };
+            };
+            return {
+              item: {
+                id: d.id,
+                ...(d.data() as Omit<LiveClassSignal, 'id'>),
+              },
+              ts: raw.createdAt?.toMillis?.() ?? 0,
+            };
+          });
+          list.sort((a, b) => a.ts - b.ts || a.item.id.localeCompare(b.item.id));
+          callback(list.map((entry) => entry.item));
         },
         (err) => {
           console.error(err);
@@ -2728,7 +2749,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     async (
       classId: string,
       toUid: string,
-      type: 'offer' | 'answer' | 'ice',
+      type: 'offer' | 'answer' | 'ice' | 'hello',
       payload: string
     ) => {
       if (!user || !toUid) return;
@@ -2738,7 +2759,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
           fromUid: user.uid,
           toUid,
           type,
-          payload: payload.slice(0, 12000),
+          payload: payload.slice(0, 32000),
           createdAt: serverTimestamp(),
         });
       } catch (err) {

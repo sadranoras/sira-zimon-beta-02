@@ -313,8 +313,8 @@
       "properties": {
         "fromUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "toUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "type": { "type": "string", "enum": ["offer", "answer", "ice"] },
-        "payload": { "type": "string", "minLength": 2, "maxLength": 12000 },
+        "type": { "type": "string", "enum": ["offer", "answer", "ice", "hello"] },
+        "payload": { "type": "string", "minLength": 2, "maxLength": 32000 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["fromUid", "toUid", "type", "payload", "createdAt"]

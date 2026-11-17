@@ -286,7 +286,7 @@ export interface LiveClassSignal {
   id: string;
   fromUid: string;
   toUid: string;
-  type: 'offer' | 'answer' | 'ice';
+  type: 'offer' | 'answer' | 'ice' | 'hello';
   payload: string;
   createdAt?: unknown;
 }

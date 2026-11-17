@@ -24,8 +24,16 @@ interface IdentityLookupUser {
   emailVerified?: boolean;
 }
 
+const adminTokenCache = new Map<string, { uid: string; email?: string; expiresAt: number }>();
+
 async function verifyAdminFromToken(idToken: string): Promise<{ uid: string; email?: string } | null> {
   if (!idToken || !firebaseConfig.apiKey) return null;
+
+  const cached = adminTokenCache.get(idToken);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { uid: cached.uid, email: cached.email };
+  }
+
   try {
     const lookupRes = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
@@ -42,7 +50,9 @@ async function verifyAdminFromToken(idToken: string): Promise<{ uid: string; ema
 
     const normalizedEmail = (authUser.email || '').trim().toLowerCase();
     if (normalizedEmail === BOOTSTRAP_ADMIN_EMAIL && authUser.emailVerified === true) {
-      return { uid: authUser.localId, email: authUser.email };
+      const entry = { uid: authUser.localId, email: authUser.email };
+      adminTokenCache.set(idToken, { ...entry, expiresAt: Date.now() + 5 * 60 * 1000 });
+      return entry;
     }
 
     // Also allow admins explicitly granted inside Firestore `admins/{uid}`
@@ -56,7 +66,9 @@ async function verifyAdminFromToken(idToken: string): Promise<{ uid: string; ema
       }
     );
     if (adminDocRes.ok) {
-      return { uid: authUser.localId, email: authUser.email };
+      const entry = { uid: authUser.localId, email: authUser.email };
+      adminTokenCache.set(idToken, { ...entry, expiresAt: Date.now() + 5 * 60 * 1000 });
+      return entry;
     }
     return null;
   } catch (err) {
@@ -66,18 +78,28 @@ async function verifyAdminFromToken(idToken: string): Promise<{ uid: string; ema
 }
 
 function buildIceServersConfig() {
+  const customStunUrl = (process.env.STUN_URL || '').trim();
+  const defaultStunUrls = [
+    'stun:stun.l.google.com:19302',
+    'stun:stun1.l.google.com:19302',
+    'stun:stun.cloudflare.com:3478',
+    'stun:global.stun.twilio.com:3478',
+  ];
+  const parsedStunUrls = customStunUrl
+    ? customStunUrl
+        .split(',')
+        .map((u) => u.trim())
+        .filter(Boolean)
+    : [];
+  const mergedStunUrls = Array.from(new Set([...parsedStunUrls, ...defaultStunUrls]));
+
   const iceServers: Array<{
     urls: string | string[];
     username?: string;
     credential?: string;
   }> = [
     {
-      urls: [
-        'stun:stun.l.google.com:19302',
-        'stun:stun1.l.google.com:19302',
-        'stun:stun.cloudflare.com:3478',
-        'stun:global.stun.twilio.com:3478',
-      ],
+      urls: mergedStunUrls,
     },
   ];
 
@@ -99,14 +121,14 @@ function buildIceServersConfig() {
     }
   }
 
-  // Cross-network TURN/TURNS relay servers (ports 80 & 443 UDP/TCP/TLS) for different ISPs / restrictive NATs
+  // Reachable TURN/TURNS relay servers (ports 80 & 443 UDP/TCP/TLS) for different ISPs / restrictive NATs
   iceServers.push(
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-        'turns:openrelay.metered.ca:443?transport=tcp',
+        'turn:global.relay.metered.ca:80',
+        'turn:global.relay.metered.ca:443',
+        'turn:global.relay.metered.ca:443?transport=tcp',
+        'turns:global.relay.metered.ca:443?transport=tcp',
       ],
       username: 'openrelayproject',
       credential: 'openrelayproject',
@@ -114,6 +136,7 @@ function buildIceServersConfig() {
     {
       urls: [
         'turn:a.relay.metered.ca:80',
+        'turn:a.relay.metered.ca:443',
         'turn:a.relay.metered.ca:443?transport=tcp',
         'turns:a.relay.metered.ca:443?transport=tcp',
       ],
@@ -128,7 +151,44 @@ function buildIceServersConfig() {
     bundlePolicy: 'max-bundle' as const,
     rtcpMuxPolicy: 'require' as const,
     hasCustomTurn: Boolean(customTurnUrl),
+    hasCustomStun: parsedStunUrls.length > 0,
   };
+}
+
+interface RelayChunk {
+  seq: number;
+  data: Buffer;
+}
+
+interface RelayRoom {
+  sessionId: string;
+  mimeType: string;
+  initChunk: Buffer | null;
+  chunks: RelayChunk[];
+  clients: Set<express.Response>;
+  updatedAt: number;
+}
+
+const liveRelayRooms = new Map<string, RelayRoom>();
+
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [classId, room] of liveRelayRooms.entries()) {
+    if (room.updatedAt < cutoff && room.clients.size === 0) {
+      liveRelayRooms.delete(classId);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+function broadcastRelayEvent(room: RelayRoom, eventPayload: Record<string, unknown>) {
+  const encoded = `data: ${JSON.stringify(eventPayload)}\n\n`;
+  for (const client of room.clients) {
+    try {
+      client.write(encoded);
+    } catch {
+      room.clients.delete(client);
+    }
+  }
 }
 
 async function startServer() {
@@ -138,6 +198,182 @@ async function startServer() {
   app.get('/api/rtc-config', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.json(buildIceServersConfig());
+  });
+
+  // Express HTTPS Live Classroom Media Relay (guarantees playback across any ISP/CGNAT/firewall)
+  app.post(
+    '/api/live-relay/:classId/chunk',
+    express.raw({ type: '*/*', limit: '4mb' }),
+    async (req, res) => {
+      const authHeader = req.headers.authorization || '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      const adminUser = token ? await verifyAdminFromToken(token) : null;
+      if (!adminUser) {
+        res.status(403).json({ error: 'Unauthorized live broadcaster' });
+        return;
+      }
+
+      const classId = String(req.params.classId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+      const sessionId =
+        typeof req.query.session === 'string'
+          ? req.query.session.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64)
+          : '';
+      const seq = Number(req.query.seq);
+      const isInit = req.query.isInit === '1' || seq === 0;
+      const mimeType =
+        typeof req.query.mime === 'string' && req.query.mime.length <= 80
+          ? req.query.mime
+          : 'video/webm;codecs=vp8,opus';
+
+      if (!classId || !sessionId || !Number.isFinite(seq) || seq < 0) {
+        res.status(400).json({ error: 'Invalid chunk parameters' });
+        return;
+      }
+
+      const bodyBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (bodyBuffer.length === 0) {
+        res.status(400).json({ error: 'Empty chunk' });
+        return;
+      }
+
+      let room = liveRelayRooms.get(classId);
+      if (!room || room.sessionId !== sessionId) {
+        const prevClients = room?.clients ?? new Set<express.Response>();
+        room = {
+          sessionId,
+          mimeType,
+          initChunk: null,
+          chunks: [],
+          clients: prevClients,
+          updatedAt: Date.now(),
+        };
+        liveRelayRooms.set(classId, room);
+      }
+
+      room.mimeType = mimeType;
+      room.updatedAt = Date.now();
+      if (isInit) {
+        room.initChunk = bodyBuffer;
+      }
+      room.chunks.push({ seq, data: bodyBuffer });
+      if (room.chunks.length > 10) {
+        room.chunks.splice(0, room.chunks.length - 10);
+      }
+
+      broadcastRelayEvent(room, {
+        type: 'chunk',
+        sessionId: room.sessionId,
+        seq,
+        mimeType: room.mimeType,
+        hasInit: Boolean(room.initChunk),
+      });
+
+      res.json({ ok: true, seq });
+    }
+  );
+
+  app.post('/api/live-relay/:classId/stop', async (req, res) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const adminUser = token ? await verifyAdminFromToken(token) : null;
+    if (!adminUser) {
+      res.status(403).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const classId = String(req.params.classId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const room = liveRelayRooms.get(classId);
+    if (room) {
+      broadcastRelayEvent(room, { type: 'stopped', sessionId: room.sessionId });
+      room.initChunk = null;
+      room.chunks = [];
+    }
+    res.json({ ok: true });
+  });
+
+  app.get('/api/live-relay/:classId/events', (req, res) => {
+    const classId = String(req.params.classId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    if (!classId) {
+      res.status(400).end();
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    let room = liveRelayRooms.get(classId);
+    if (!room) {
+      room = {
+        sessionId: '',
+        mimeType: '',
+        initChunk: null,
+        chunks: [],
+        clients: new Set<express.Response>(),
+        updatedAt: Date.now(),
+      };
+      liveRelayRooms.set(classId, room);
+    }
+
+    room.clients.add(res);
+    res.write(
+      `data: ${JSON.stringify({
+        type: 'state',
+        active: Boolean(room.sessionId && room.initChunk),
+        sessionId: room.sessionId,
+        mimeType: room.mimeType,
+        hasInit: Boolean(room.initChunk),
+        latestSeqs: room.chunks.map((c) => c.seq),
+      })}\n\n`
+    );
+
+    const keepalive = setInterval(() => {
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        clearInterval(keepalive);
+      }
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(keepalive);
+      liveRelayRooms.get(classId)?.clients.delete(res);
+    });
+  });
+
+  app.get('/api/live-relay/:classId/chunk/:seq', (req, res) => {
+    const classId = String(req.params.classId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const room = liveRelayRooms.get(classId);
+    if (!room) {
+      res.status(404).end();
+      return;
+    }
+
+    const reqSession = typeof req.query.session === 'string' ? req.query.session : '';
+    if (reqSession && room.sessionId && reqSession !== room.sessionId) {
+      res.status(409).end();
+      return;
+    }
+
+    const seqParam = req.params.seq;
+    let payload: Buffer | null = null;
+    if (seqParam === 'init') {
+      payload = room.initChunk;
+    } else {
+      const seqNum = Number(seqParam);
+      payload = room.chunks.find((c) => c.seq === seqNum)?.data ?? null;
+    }
+
+    if (!payload) {
+      res.status(404).end();
+      return;
+    }
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.send(payload);
   });
 
   // Streaming file upload endpoint for Admin offline lesson videos and PDF booklets

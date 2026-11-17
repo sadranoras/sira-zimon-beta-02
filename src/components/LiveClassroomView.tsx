@@ -31,8 +31,11 @@ import {
   Volume2,
   VolumeX,
   Wifi,
+  WifiOff,
+  Cloud,
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { auth } from '../firebase';
 import { DIAMOND_PACKAGE } from '../data/seedData';
 import type {
   LiveClass,
@@ -44,6 +47,18 @@ import type {
 } from '../types';
 import { formatIranScheduleRange, toPersianDigits } from '../utils/formatters';
 
+type RtcConnectionStatus = 'idle' | 'connecting' | 'stable' | 'reconnecting' | 'disconnected';
+
+interface RtcConfigPayload extends RTCConfiguration {
+  hasCustomTurn?: boolean;
+  hasCustomStun?: boolean;
+}
+
+interface RtcQualityMetrics {
+  rttMs: number | null;
+  route: 'direct' | 'stun' | 'turn' | 'cloud' | null;
+}
+
 const PEN_COLORS = [
   { id: 'emerald', hex: '#34d399', label: 'سبز' },
   { id: 'white', hex: '#f8fafc', label: 'سفید' },
@@ -52,7 +67,7 @@ const PEN_COLORS = [
   { id: 'rose', hex: '#fb7185', label: 'قرمز' },
 ];
 
-const DEFAULT_RTC_CONFIG: RTCConfiguration = {
+const DEFAULT_RTC_CONFIG: RtcConfigPayload = {
   iceServers: [
     {
       urls: [
@@ -63,10 +78,12 @@ const DEFAULT_RTC_CONFIG: RTCConfiguration = {
     },
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
-        'turns:openrelay.metered.ca:443?transport=tcp',
+        'turn:global.relay.metered.ca:80',
+        'turn:global.relay.metered.ca:443',
+        'turn:global.relay.metered.ca:443?transport=tcp',
+        'turns:global.relay.metered.ca:443?transport=tcp',
+        'turn:a.relay.metered.ca:443',
+        'turns:a.relay.metered.ca:443?transport=tcp',
       ],
       username: 'openrelayproject',
       credential: 'openrelayproject',
@@ -75,6 +92,8 @@ const DEFAULT_RTC_CONFIG: RTCConfiguration = {
   iceCandidatePoolSize: 10,
   bundlePolicy: 'max-bundle',
   rtcpMuxPolicy: 'require',
+  hasCustomTurn: false,
+  hasCustomStun: false,
 };
 
 async function tuneVideoSenderBitrate(
@@ -99,7 +118,7 @@ async function tuneVideoSenderBitrate(
 }
 
 interface SignalEnvelope {
-  channel: 'host-to-student' | 'student-to-host';
+  channel: 'host-to-student' | 'student-to-host' | 'viewer-hello';
   sdp?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
 }
@@ -107,9 +126,12 @@ interface SignalEnvelope {
 const StreamVideo: React.FC<{
   stream: MediaStream | null;
   muted?: boolean;
+  onAutoplayBlocked?: () => void;
   className?: string;
-}> = ({ stream, muted = false, className = '' }) => {
+}> = ({ stream, muted = false, onAutoplayBlocked, className = '' }) => {
   const ref = useRef<HTMLVideoElement | null>(null);
+  const onBlockedRef = useRef(onAutoplayBlocked);
+  onBlockedRef.current = onAutoplayBlocked;
 
   useEffect(() => {
     const el = ref.current;
@@ -117,14 +139,296 @@ const StreamVideo: React.FC<{
     if (el.srcObject !== stream) {
       el.srcObject = stream;
     }
+    el.muted = muted;
     if (stream) {
       el.play().catch(() => {
-        // Browser autoplay policy may hold unmuted audio until click
+        // Browser autoplay policy blocks unmuted autoplay: fall back to muted video so picture plays immediately
+        if (!muted) {
+          el.muted = true;
+          el.play().catch(() => {});
+          onBlockedRef.current?.();
+        }
       });
     }
-  }, [stream]);
+  }, [stream, muted]);
 
   return <video ref={ref} autoPlay playsInline muted={muted} className={className} />;
+};
+
+const CloudRelayPlayer: React.FC<{
+  classId: string;
+  muted: boolean;
+  onAutoplayBlocked?: () => void;
+  onStatusChange?: (status: 'connecting' | 'playing' | 'waiting') => void;
+  className?: string;
+}> = ({ classId, muted, onAutoplayBlocked, onStatusChange, className = '' }) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const onBlockedRef = useRef(onAutoplayBlocked);
+  onBlockedRef.current = onAutoplayBlocked;
+  const onStatusRef = useRef(onStatusChange);
+  onStatusRef.current = onStatusChange;
+
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = muted;
+    if (!muted && v.src && v.paused) {
+      v.play().catch(() => {
+        v.muted = true;
+        v.play().catch(() => {});
+        onBlockedRef.current?.();
+      });
+    }
+  }, [muted]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !classId || typeof EventSource === 'undefined') return;
+
+    let cancelled = false;
+    let activeSessionId = '';
+    let lastSeq = -1;
+    let mediaSource: MediaSource | null = null;
+    let sourceBuffer: SourceBuffer | null = null;
+    let objectUrl: string | null = null;
+    let queue: ArrayBuffer[] = [];
+    let fetchChain = Promise.resolve();
+
+    const pickSupportedMime = (mime: string): string => {
+      if (typeof MediaSource === 'undefined') return '';
+      const isAudio = mime.startsWith('audio/');
+      const candidates = [
+        mime,
+        isAudio ? 'audio/webm;codecs=opus' : 'video/webm;codecs=vp8,opus',
+        isAudio ? 'audio/webm' : 'video/webm;codecs=vp8',
+        isAudio ? 'audio/webm' : 'video/webm',
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        if (MediaSource.isTypeSupported(candidate)) return candidate;
+      }
+      return '';
+    };
+
+    const cleanupPipeline = () => {
+      queue = [];
+      sourceBuffer = null;
+      if (mediaSource) {
+        try {
+          if (mediaSource.readyState === 'open') {
+            mediaSource.endOfStream();
+          }
+        } catch {
+          // ignore
+        }
+        mediaSource = null;
+      }
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+        objectUrl = null;
+      }
+      if (video) {
+        video.removeAttribute('src');
+        video.load();
+      }
+    };
+
+    const flushQueue = () => {
+      if (
+        cancelled ||
+        !sourceBuffer ||
+        sourceBuffer.updating ||
+        !mediaSource ||
+        mediaSource.readyState !== 'open'
+      ) {
+        return;
+      }
+      try {
+        if (sourceBuffer.buffered.length > 0) {
+          const start = sourceBuffer.buffered.start(0);
+          const end = sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1);
+          if (end - start > 26) {
+            sourceBuffer.remove(start, end - 18);
+            return;
+          }
+        }
+        if (queue.length === 0) return;
+        const nextBuf = queue.shift()!;
+        sourceBuffer.appendBuffer(nextBuf);
+      } catch {
+        // Recover cleanly on next session chunk if buffer state resets
+        queue = [];
+      }
+    };
+
+    const startPipeline = (
+      sessionId: string,
+      mimeType: string,
+      initialSeqs: Array<number | 'init'>
+    ) => {
+      cleanupPipeline();
+      const supportedMime = pickSupportedMime(mimeType);
+      if (!supportedMime) {
+        onStatusRef.current?.('waiting');
+        return;
+      }
+
+      onStatusRef.current?.('connecting');
+      const ms = new MediaSource();
+      mediaSource = ms;
+      objectUrl = URL.createObjectURL(ms);
+      video.src = objectUrl;
+      video.muted = mutedRef.current;
+
+      ms.addEventListener('sourceopen', () => {
+        if (cancelled || mediaSource !== ms) return;
+        try {
+          const sb = ms.addSourceBuffer(supportedMime);
+          try {
+            sb.mode = 'sequence';
+          } catch {
+            // Some browsers enforce segments mode
+          }
+          sourceBuffer = sb;
+
+          sb.addEventListener('updateend', () => {
+            if (cancelled || sourceBuffer !== sb) return;
+            try {
+              if (sb.buffered.length > 0) {
+                const bStart = sb.buffered.start(0);
+                const bEnd = sb.buffered.end(sb.buffered.length - 1);
+                if (video.currentTime < bStart || bEnd - video.currentTime > 2.8) {
+                  video.currentTime = Math.max(bStart, bEnd - 0.5);
+                }
+                onStatusRef.current?.('playing');
+                if (video.paused) {
+                  video.muted = mutedRef.current;
+                  video.play().catch(() => {
+                    if (!mutedRef.current) {
+                      video.muted = true;
+                      video.play().catch(() => {});
+                      onBlockedRef.current?.();
+                    }
+                  });
+                }
+              }
+            } catch {
+              // ignore buffered inspection error
+            }
+            flushQueue();
+          });
+
+          flushQueue();
+        } catch {
+          onStatusRef.current?.('waiting');
+        }
+      });
+
+      const enqueueFetch = (seqVal: number | 'init') => {
+        fetchChain = fetchChain.then(async () => {
+          if (cancelled || activeSessionId !== sessionId) return;
+          const res = await fetch(
+            `/api/live-relay/${encodeURIComponent(classId)}/chunk/${seqVal}?session=${encodeURIComponent(sessionId)}`,
+            { cache: 'no-store' }
+          );
+          if (!res.ok || cancelled || activeSessionId !== sessionId) return;
+          const buf = await res.arrayBuffer();
+          if (cancelled || activeSessionId !== sessionId) return;
+          queue.push(buf);
+          flushQueue();
+        }).catch(() => {});
+      };
+
+      initialSeqs.forEach(enqueueFetch);
+    };
+
+    onStatusRef.current?.('connecting');
+    const es = new EventSource(`/api/live-relay/${encodeURIComponent(classId)}/events`);
+
+    es.onmessage = (ev) => {
+      if (cancelled) return;
+      try {
+        const msg = JSON.parse(ev.data) as {
+          type: 'state' | 'chunk' | 'stopped';
+          active?: boolean;
+          sessionId?: string;
+          mimeType?: string;
+          hasInit?: boolean;
+          latestSeqs?: number[];
+          seq?: number;
+        };
+
+        if (msg.type === 'stopped') {
+          activeSessionId = '';
+          lastSeq = -1;
+          cleanupPipeline();
+          onStatusRef.current?.('waiting');
+          return;
+        }
+
+        if (msg.type === 'state') {
+          if (msg.active && msg.sessionId && msg.hasInit) {
+            activeSessionId = msg.sessionId;
+            const tail = Array.isArray(msg.latestSeqs)
+              ? msg.latestSeqs.filter((n) => typeof n === 'number' && n > 0).slice(-3)
+              : [];
+            lastSeq = tail.length > 0 ? tail[tail.length - 1] : 0;
+            startPipeline(
+              msg.sessionId,
+              msg.mimeType || 'video/webm;codecs=vp8,opus',
+              ['init', ...tail]
+            );
+          } else {
+            onStatusRef.current?.('waiting');
+          }
+          return;
+        }
+
+        if (msg.type === 'chunk') {
+          const sId = msg.sessionId || '';
+          if (!sId || !msg.hasInit) return;
+          const seqNum = typeof msg.seq === 'number' ? msg.seq : 0;
+
+          if (sId !== activeSessionId) {
+            activeSessionId = sId;
+            lastSeq = seqNum;
+            const initialList: Array<number | 'init'> = seqNum > 0 ? ['init', seqNum] : ['init'];
+            startPipeline(sId, msg.mimeType || 'video/webm;codecs=vp8,opus', initialList);
+            return;
+          }
+
+          if (seqNum > lastSeq) {
+            lastSeq = seqNum;
+            fetchChain = fetchChain
+              .then(async () => {
+                if (cancelled || activeSessionId !== sId) return;
+                const res = await fetch(
+                  `/api/live-relay/${encodeURIComponent(classId)}/chunk/${seqNum}?session=${encodeURIComponent(sId)}`,
+                  { cache: 'no-store' }
+                );
+                if (!res.ok || cancelled || activeSessionId !== sId) return;
+                const buf = await res.arrayBuffer();
+                if (cancelled || activeSessionId !== sId) return;
+                queue.push(buf);
+                flushQueue();
+              })
+              .catch(() => {});
+          }
+        }
+      } catch {
+        // ignore malformed SSE event
+      }
+    };
+
+    return () => {
+      cancelled = true;
+      es.close();
+      cleanupPipeline();
+    };
+  }, [classId]);
+
+  return <video ref={videoRef} autoPlay playsInline muted={muted} className={className} />;
 };
 
 export const LiveClassroomView: React.FC = () => {
@@ -227,17 +531,35 @@ export const LiveClassroomView: React.FC = () => {
   // Remote WebRTC media streams & cross-network relay state
   const [remoteHostStream, setRemoteHostStream] = useState<MediaStream | null>(null);
   const [remoteHostAudioMuted, setRemoteHostAudioMuted] = useState(false);
+  const [autoplayAudioBlocked, setAutoplayAudioBlocked] = useState(false);
   const [remoteStudentStreams, setRemoteStudentStreams] = useState<Record<string, MediaStream>>({});
-  const [baseRtcConfig, setBaseRtcConfig] = useState<RTCConfiguration>(DEFAULT_RTC_CONFIG);
+  const [baseRtcConfig, setBaseRtcConfig] = useState<RtcConfigPayload>(DEFAULT_RTC_CONFIG);
   const [forceRelayMode, setForceRelayMode] = useState(false);
-  const [rtcReconnectSeq, setRtcReconnectSeq] = useState(0);
-  const [rtcNetworkStatus, setRtcNetworkStatus] = useState<
-    'idle' | 'connecting' | 'connected' | 'reconnecting'
+  const [manualCloudRelay, setManualCloudRelay] = useState(false);
+  const [autoCloudRelay, setAutoCloudRelay] = useState(false);
+  const [cloudRelayStatus, setCloudRelayStatus] = useState<
+    'idle' | 'connecting' | 'playing' | 'waiting'
   >('idle');
+  const [rtcReconnectSeq, setRtcReconnectSeq] = useState(0);
+  const [rtcNetworkStatus, setRtcNetworkStatus] = useState<RtcConnectionStatus>('idle');
+  const [rtcQuality, setRtcQuality] = useState<RtcQualityMetrics>({ rttMs: null, route: null });
+  const [isBrowserOnline, setIsBrowserOnline] = useState(() =>
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
+
+  const cloudRelayRecorderRef = useRef<MediaRecorder | null>(null);
+  const cloudRelayGenRef = useRef(0);
+  const mediaModeRef = useRef<LiveClassMediaMode>('none');
+  mediaModeRef.current = mediaMode;
+  const rtcConfigLoadedRef = useRef(false);
+  const rtcConfigFetchPromiseRef = useRef<Promise<RtcConfigPayload> | null>(null);
 
   const effectiveRtcConfig = useMemo<RTCConfiguration>(
     () => ({
-      ...baseRtcConfig,
+      iceServers: baseRtcConfig.iceServers,
+      iceCandidatePoolSize: baseRtcConfig.iceCandidatePoolSize ?? 10,
+      bundlePolicy: baseRtcConfig.bundlePolicy ?? 'max-bundle',
+      rtcpMuxPolicy: baseRtcConfig.rtcpMuxPolicy ?? 'require',
       iceTransportPolicy: forceRelayMode ? 'relay' : 'all',
     }),
     [baseRtcConfig, forceRelayMode]
@@ -245,20 +567,61 @@ export const LiveClassroomView: React.FC = () => {
   const effectiveRtcConfigRef = useRef<RTCConfiguration>(effectiveRtcConfig);
   effectiveRtcConfigRef.current = effectiveRtcConfig;
 
+  const loadRtcConfigFromServer = useCallback((): Promise<RtcConfigPayload> => {
+    if (rtcConfigLoadedRef.current && rtcConfigFetchPromiseRef.current) {
+      return rtcConfigFetchPromiseRef.current;
+    }
+    if (!rtcConfigFetchPromiseRef.current) {
+      rtcConfigFetchPromiseRef.current = fetch('/api/rtc-config', { cache: 'no-store' })
+        .then((res) => (res.ok ? (res.json() as Promise<RtcConfigPayload>) : null))
+        .then((data) => {
+          if (data && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+            rtcConfigLoadedRef.current = true;
+            setBaseRtcConfig(data);
+            return data;
+          }
+          return DEFAULT_RTC_CONFIG;
+        })
+        .catch(() => DEFAULT_RTC_CONFIG);
+    }
+    return rtcConfigFetchPromiseRef.current;
+  }, []);
+
+  const ensureRtcConfigReady = useCallback(async (): Promise<RTCConfiguration> => {
+    if (!rtcConfigLoadedRef.current) {
+      const timeout = new Promise<RtcConfigPayload>((resolve) =>
+        window.setTimeout(() => resolve(DEFAULT_RTC_CONFIG), 1500)
+      );
+      const loaded = await Promise.race([loadRtcConfigFromServer(), timeout]);
+      return {
+        iceServers: loaded.iceServers ?? DEFAULT_RTC_CONFIG.iceServers,
+        iceCandidatePoolSize: loaded.iceCandidatePoolSize ?? 10,
+        bundlePolicy: loaded.bundlePolicy ?? 'max-bundle',
+        rtcpMuxPolicy: loaded.rtcpMuxPolicy ?? 'require',
+        iceTransportPolicy: forceRelayMode ? 'relay' : 'all',
+      };
+    }
+    return effectiveRtcConfigRef.current;
+  }, [forceRelayMode, loadRtcConfigFromServer]);
+
   useEffect(() => {
-    let active = true;
-    fetch('/api/rtc-config')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: RTCConfiguration | null) => {
-        if (active && data && Array.isArray(data.iceServers) && data.iceServers.length > 0) {
-          setBaseRtcConfig(data);
-        }
-      })
-      .catch(() => {
-        // Fallback to DEFAULT_RTC_CONFIG
-      });
+    void loadRtcConfigFromServer();
+  }, [loadRtcConfigFromServer]);
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsBrowserOnline(true);
+      setRtcReconnectSeq((s) => s + 1);
+    };
+    const handleOffline = () => {
+      setIsBrowserOnline(false);
+      setRtcNetworkStatus('disconnected');
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
     return () => {
-      active = false;
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
     };
   }, []);
 
@@ -292,9 +655,9 @@ export const LiveClassroomView: React.FC = () => {
   );
 
   const instructorUid = useMemo(() => {
+    if (activeClass?.hostUid) return activeClass.hostUid;
     const onlineInstructor = participants.find((p) => p.role === 'instructor')?.userId;
     if (onlineInstructor) return onlineInstructor;
-    if (activeClass?.hostUid) return activeClass.hostUid;
     if (activeClass?.createdBy && activeClass.createdBy !== 'seed-admin') return activeClass.createdBy;
     return '';
   }, [participants, activeClass?.hostUid, activeClass?.createdBy]);
@@ -319,8 +682,56 @@ export const LiveClassroomView: React.FC = () => {
     pendingIceRef.current.clear();
     setRemoteHostStream(null);
     setRemoteStudentStreams({});
-    setRtcNetworkStatus('idle');
-  }, []);
+    setAutoplayAudioBlocked(false);
+    setRtcQuality({ rttMs: null, route: null });
+    setRtcNetworkStatus(isBrowserOnline ? 'idle' : 'disconnected');
+  }, [isBrowserOnline]);
+
+  const syncHostAggregateStatus = useCallback(() => {
+    if (!isBrowserOnline) {
+      setRtcNetworkStatus('disconnected');
+      return;
+    }
+    const peers = [
+      ...Array.from(hostOutboundPeersRef.current.values()),
+      ...Array.from(incomingStudentPeersRef.current.values()),
+    ];
+    if (peers.length === 0) {
+      setRtcNetworkStatus(localHostStreamRef.current ? 'stable' : 'idle');
+      return;
+    }
+    let hasStable = false;
+    let hasReconnecting = false;
+    let hasConnecting = false;
+    let hasDisconnectedOrFailed = false;
+    for (const pc of peers) {
+      const ice = pc.iceConnectionState;
+      const conn = pc.connectionState;
+      if (conn === 'connected' || ice === 'connected' || ice === 'completed') {
+        hasStable = true;
+      } else if (ice === 'disconnected' || conn === 'disconnected') {
+        hasReconnecting = true;
+      } else if (conn === 'failed' || ice === 'failed' || conn === 'closed') {
+        hasDisconnectedOrFailed = true;
+      } else {
+        hasConnecting = true;
+      }
+    }
+    if (hasStable) {
+      setRtcNetworkStatus('stable');
+    } else if (hasReconnecting) {
+      setRtcNetworkStatus('reconnecting');
+    } else if (hasConnecting) {
+      setRtcNetworkStatus('connecting');
+    } else if (hasDisconnectedOrFailed) {
+      setRtcNetworkStatus('disconnected');
+    } else {
+      setRtcNetworkStatus('idle');
+    }
+  }, [isBrowserOnline]);
+
+  const syncHostAggregateStatusRef = useRef(syncHostAggregateStatus);
+  syncHostAggregateStatusRef.current = syncHostAggregateStatus;
 
   const handleToggleRelayAndReconnect = useCallback(
     (nextRelay?: boolean) => {
@@ -341,9 +752,106 @@ export const LiveClassroomView: React.FC = () => {
     [closeAllPeerConnections, notify]
   );
 
+  const stopCloudRelayBroadcaster = useCallback(
+    async (notifyServer = true, targetClassId = activeClassId) => {
+      cloudRelayGenRef.current += 1;
+      const recorder = cloudRelayRecorderRef.current;
+      cloudRelayRecorderRef.current = null;
+      if (recorder) {
+        try {
+          if (recorder.state !== 'inactive') {
+            recorder.stop();
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (notifyServer && isAdmin && targetClassId) {
+        try {
+          const token = await auth.currentUser?.getIdToken();
+          if (token) {
+            await fetch(`/api/live-relay/${encodeURIComponent(targetClassId)}/stop`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${token}` },
+            });
+          }
+        } catch {
+          // ignore cleanup failure
+        }
+      }
+    },
+    [activeClassId, isAdmin]
+  );
+
+  const startCloudRelayBroadcaster = useCallback((classId: string, stream: MediaStream) => {
+    if (typeof MediaRecorder === 'undefined') return;
+    cloudRelayGenRef.current += 1;
+    const gen = cloudRelayGenRef.current;
+    if (cloudRelayRecorderRef.current) {
+      try {
+        if (cloudRelayRecorderRef.current.state !== 'inactive') {
+          cloudRelayRecorderRef.current.stop();
+        }
+      } catch {
+        // ignore
+      }
+      cloudRelayRecorderRef.current = null;
+    }
+
+    const hasVideo = stream.getVideoTracks().length > 0;
+    const candidates = hasVideo
+      ? ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8', 'video/webm']
+      : ['audio/webm;codecs=opus', 'audio/webm'];
+    const chosenMime = candidates.find((c) => MediaRecorder.isTypeSupported(c)) || '';
+
+    try {
+      const recorder = new MediaRecorder(
+        stream,
+        chosenMime
+          ? { mimeType: chosenMime, videoBitsPerSecond: 450_000, audioBitsPerSecond: 64_000 }
+          : undefined
+      );
+      const sessionId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      let seq = 0;
+      let uploadChain = Promise.resolve();
+
+      recorder.ondataavailable = (ev) => {
+        if (cloudRelayGenRef.current !== gen || !ev.data || ev.data.size === 0) return;
+        const mySeq = seq++;
+        const isInit = mySeq === 0 ? '1' : '0';
+        const blob = ev.data;
+        const mimeParam = encodeURIComponent(recorder.mimeType || chosenMime || 'video/webm;codecs=vp8,opus');
+        uploadChain = uploadChain
+          .then(async () => {
+            if (cloudRelayGenRef.current !== gen) return;
+            const token = await auth.currentUser?.getIdToken();
+            if (!token || cloudRelayGenRef.current !== gen) return;
+            await fetch(
+              `/api/live-relay/${encodeURIComponent(classId)}/chunk?session=${encodeURIComponent(sessionId)}&seq=${mySeq}&isInit=${isInit}&mime=${mimeParam}`,
+              {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  'Content-Type': 'application/octet-stream',
+                },
+                body: blob,
+              }
+            );
+          })
+          .catch(() => {});
+      };
+
+      recorder.start(900);
+      cloudRelayRecorderRef.current = recorder;
+    } catch (err) {
+      console.error('Cloud relay recorder start failed:', err);
+    }
+  }, []);
+
   const stopHostMedia = useCallback(
     async (syncFirestore = true, targetClassId = activeClassId) => {
       const hadStream = Boolean(localHostStreamRef.current);
+      await stopCloudRelayBroadcaster(syncFirestore && hadStream, targetClassId);
       if (localHostStreamRef.current) {
         localHostStreamRef.current.getTracks().forEach((t) => t.stop());
         localHostStreamRef.current = null;
@@ -362,7 +870,7 @@ export const LiveClassroomView: React.FC = () => {
         await upsertMyLiveClassPresence(targetClassId, { cameraActive: false, micActive: false });
       }
     },
-    [activeClassId, isAdmin, updateHostMediaState, upsertMyLiveClassPresence]
+    [activeClassId, isAdmin, stopCloudRelayBroadcaster, updateHostMediaState, upsertMyLiveClassPresence]
   );
 
   const stopStudentMedia = useCallback(
@@ -390,16 +898,24 @@ export const LiveClassroomView: React.FC = () => {
     [activeClassId, user, upsertMyLiveClassPresence]
   );
 
-  // Cleanup when leaving view or changing active class
+  // Store latest cleanup callbacks in refs so switching userProfile/isAdmin NEVER kills active streams mid-class
+  const stopHostMediaRef = useRef(stopHostMedia);
+  stopHostMediaRef.current = stopHostMedia;
+  const stopStudentMediaRef = useRef(stopStudentMedia);
+  stopStudentMediaRef.current = stopStudentMedia;
+  const closeAllPeerConnectionsRef = useRef(closeAllPeerConnections);
+  closeAllPeerConnectionsRef.current = closeAllPeerConnections;
+
+  // Cleanup ONLY when leaving view or switching activeClassId
   useEffect(() => {
     const classIdSnapshot = activeClassId;
     return () => {
-      void stopHostMedia(true, classIdSnapshot);
-      void stopStudentMedia(true, classIdSnapshot);
-      closeAllPeerConnections();
+      void stopHostMediaRef.current(true, classIdSnapshot);
+      void stopStudentMediaRef.current(true, classIdSnapshot);
+      closeAllPeerConnectionsRef.current();
       processedSignalsRef.current.clear();
     };
-  }, [activeClassId, closeAllPeerConnections, stopHostMedia, stopStudentMedia]);
+  }, [activeClassId]);
 
   // Sync instructor board inputs when switching class
   useEffect(() => {
@@ -441,11 +957,11 @@ export const LiveClassroomView: React.FC = () => {
     subscribeLiveClassParticipants,
   ]);
 
-  // Register presence on class entry for authorized signed-in users
+  // Register presence on class entry (and re-run when instructor starts broadcasting on a newly created class doc)
   useEffect(() => {
     if (!user || !activeClassId || !hasClassAccess) return;
     void upsertMyLiveClassPresence(activeClassId, {});
-  }, [user, activeClassId, hasClassAccess, upsertMyLiveClassPresence]);
+  }, [user, activeClassId, hasClassAccess, activeClass?.hostMediaMode, upsertMyLiveClassPresence]);
 
   // Clear remote host video on students if instructor stopped broadcasting
   useEffect(() => {
@@ -456,8 +972,30 @@ export const LiveClassroomView: React.FC = () => {
         incomingHostPcRef.current = null;
       }
       setRemoteHostStream(null);
+      setAutoCloudRelay(false);
+      setAutoplayAudioBlocked(false);
     }
   }, [isAdmin, activeClass?.hostMediaMode]);
+
+  // Auto-activate HTTPS Cloud Relay if WebRTC does not deliver host media within 4.5s (e.g. strict CGNAT/ISP UDP blocking) or for free-class guests
+  useEffect(() => {
+    if (isAdmin || !hasClassAccess || !activeClass?.hostMediaMode || activeClass.hostMediaMode === 'none') {
+      setAutoCloudRelay(false);
+      return;
+    }
+    if (remoteHostStream) {
+      setAutoCloudRelay(false);
+      return;
+    }
+    if (!user) {
+      setAutoCloudRelay(true);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setAutoCloudRelay(true);
+    }, 4500);
+    return () => window.clearTimeout(timer);
+  }, [isAdmin, user, hasClassAccess, activeClass?.hostMediaMode, remoteHostStream, rtcReconnectSeq]);
 
   // CRITICAL: Immediately terminate student camera/mic if instructor revokes permission
   const hadPublishPermissionRef = useRef(false);
@@ -494,33 +1032,31 @@ export const LiveClassroomView: React.FC = () => {
     });
   }, [isAdmin, participants]);
 
-  // Instructor: Maintain outbound WebRTC connections from Host -> Online Students
-  useEffect(() => {
-    if (!isAdmin || !user || !activeClassId || !localHostStream) return;
+  const helloPeerGraceRef = useRef<Map<string, number>>(new Map());
 
-    const studentTargets = participants.filter((p) => p.userId !== user.uid && p.role === 'student');
-    const targetIds = new Set(studentTargets.map((s) => s.userId));
+  const createHostPeerOfferForStudent = useCallback(
+    async (targetUid: string, forceRecreate = false) => {
+      const hostStream = localHostStreamRef.current;
+      if (!isAdmin || !user || !activeClassId || !hostStream || targetUid === user.uid) return;
 
-    // Close connections for students no longer present
-    for (const [uid, pc] of hostOutboundPeersRef.current.entries()) {
-      if (!targetIds.has(uid)) {
-        pc.close();
-        hostOutboundPeersRef.current.delete(uid);
+      if (forceRecreate && hostOutboundPeersRef.current.has(targetUid)) {
+        hostOutboundPeersRef.current.get(targetUid)?.close();
+        hostOutboundPeersRef.current.delete(targetUid);
+        pendingIceRef.current.delete(`student-out:${targetUid}`);
       }
-    }
+      if (hostOutboundPeersRef.current.has(targetUid)) return;
 
-    // Create connection for each connected student not yet wired
-    studentTargets.forEach((student) => {
-      if (hostOutboundPeersRef.current.has(student.userId)) return;
+      const rtcCfg = await ensureRtcConfigReady();
+      if (!localHostStreamRef.current || hostOutboundPeersRef.current.has(targetUid)) return;
 
-      const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
-      hostOutboundPeersRef.current.set(student.userId, pc);
-      setRtcNetworkStatus('connecting');
+      const pc = new RTCPeerConnection(rtcCfg);
+      hostOutboundPeersRef.current.set(targetUid, pc);
+      syncHostAggregateStatusRef.current();
 
-      localHostStream.getTracks().forEach((track) => {
-        pc.addTrack(track, localHostStream);
+      localHostStreamRef.current.getTracks().forEach((track) => {
+        pc.addTrack(track, localHostStreamRef.current!);
       });
-      void tuneVideoSenderBitrate(pc, mediaMode);
+      void tuneVideoSenderBitrate(pc, mediaModeRef.current);
 
       const sendOffer = async (iceRestart = false) => {
         try {
@@ -531,7 +1067,7 @@ export const LiveClassroomView: React.FC = () => {
             channel: 'host-to-student',
             sdp: pc.localDescription?.toJSON() ?? offer,
           };
-          await sendLiveClassSignal(activeClassId, student.userId, 'offer', JSON.stringify(envelope));
+          await sendLiveClassSignal(activeClassId, targetUid, 'offer', JSON.stringify(envelope));
         } catch (err) {
           console.error('Host WebRTC offer error:', err);
         }
@@ -543,40 +1079,113 @@ export const LiveClassroomView: React.FC = () => {
             channel: 'host-to-student',
             candidate: ev.candidate.toJSON(),
           };
-          void sendLiveClassSignal(activeClassId, student.userId, 'ice', JSON.stringify(envelope));
+          void sendLiveClassSignal(activeClassId, targetUid, 'ice', JSON.stringify(envelope));
         }
       };
 
       pc.oniceconnectionstatechange = () => {
         const st = pc.iceConnectionState;
-        if (st === 'connected' || st === 'completed') {
-          setRtcNetworkStatus('connected');
-        } else if (st === 'disconnected') {
-          setRtcNetworkStatus('reconnecting');
-        } else if (st === 'failed') {
+        if (st === 'failed') {
           setRtcNetworkStatus('reconnecting');
           pc.restartIce();
           void sendOffer(true);
         }
+        syncHostAggregateStatusRef.current();
       };
 
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-          if (hostOutboundPeersRef.current.get(student.userId) === pc) {
-            hostOutboundPeersRef.current.delete(student.userId);
+          if (hostOutboundPeersRef.current.get(targetUid) === pc) {
+            hostOutboundPeersRef.current.delete(targetUid);
           }
         }
+        syncHostAggregateStatusRef.current();
       };
 
       void sendOffer(false);
+    },
+    [isAdmin, user, activeClassId, ensureRtcConfigReady, sendLiveClassSignal]
+  );
+
+  const createHostPeerOfferForStudentRef = useRef(createHostPeerOfferForStudent);
+  createHostPeerOfferForStudentRef.current = createHostPeerOfferForStudent;
+
+  // Instructor: Maintain outbound WebRTC connections from Host -> Online Students
+  useEffect(() => {
+    if (!isAdmin || !user || !activeClassId || !localHostStream) return;
+
+    const studentTargets = participants.filter((p) => p.userId !== user.uid && p.role === 'student');
+    const targetIds = new Set(studentTargets.map((s) => s.userId));
+    const now = Date.now();
+
+    // Close connections for students no longer present (respect 15s hello grace so late-syncing presence isn't killed)
+    for (const [uid, pc] of hostOutboundPeersRef.current.entries()) {
+      const helloAt = helloPeerGraceRef.current.get(uid) ?? 0;
+      if (!targetIds.has(uid) && now - helloAt > 15000) {
+        pc.close();
+        hostOutboundPeersRef.current.delete(uid);
+      }
+    }
+
+    // Create connection for each connected student not yet wired
+    studentTargets.forEach((student) => {
+      createHostPeerOfferForStudent(student.userId, false);
     });
   }, [
     isAdmin,
     user,
     activeClassId,
     localHostStream,
-    mediaMode,
     participants,
+    rtcReconnectSeq,
+    createHostPeerOfferForStudent,
+  ]);
+
+  // Student: Send periodic 'viewer-hello' request until host stream arrives (fixes late-join, refresh & reconnect)
+  useEffect(() => {
+    if (
+      isAdmin ||
+      !user ||
+      !activeClassId ||
+      !hasClassAccess ||
+      !activeClass?.hostMediaMode ||
+      activeClass.hostMediaMode === 'none' ||
+      remoteHostStream
+    ) {
+      return;
+    }
+
+    const targets = Array.from(
+      new Set(
+        [
+          activeClass?.hostUid,
+          participants.find((p) => p.role === 'instructor')?.userId,
+          activeClass?.createdBy && activeClass.createdBy !== 'seed-admin' ? activeClass.createdBy : '',
+        ].filter((id): id is string => Boolean(id) && id !== user.uid)
+      )
+    );
+    if (targets.length === 0) return;
+
+    const sendHello = () => {
+      const payload = JSON.stringify({ channel: 'viewer-hello' } satisfies SignalEnvelope);
+      targets.forEach((tUid) => {
+        void sendLiveClassSignal(activeClassId, tUid, 'hello', payload);
+      });
+    };
+
+    sendHello();
+    const interval = window.setInterval(sendHello, 4000);
+    return () => window.clearInterval(interval);
+  }, [
+    isAdmin,
+    user,
+    activeClassId,
+    hasClassAccess,
+    activeClass?.hostMediaMode,
+    activeClass?.hostUid,
+    activeClass?.createdBy,
+    participants,
+    remoteHostStream,
     rtcReconnectSeq,
     sendLiveClassSignal,
   ]);
@@ -594,56 +1203,80 @@ export const LiveClassroomView: React.FC = () => {
       return;
     }
 
-    if (studentOutboundPcRef.current) {
-      studentOutboundPcRef.current.close();
-      studentOutboundPcRef.current = null;
-    }
+    let cancelled = false;
+    let activePc: RTCPeerConnection | null = null;
 
-    const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
-    studentOutboundPcRef.current = pc;
+    void (async () => {
+      const rtcCfg = await ensureRtcConfigReady();
+      if (cancelled) return;
 
-    localStudentStream.getTracks().forEach((track) => {
-      pc.addTrack(track, localStudentStream);
-    });
-    void tuneVideoSenderBitrate(pc, 'student');
-
-    const sendStudentOffer = async (iceRestart = false) => {
-      try {
-        if (pc.signalingState === 'closed') return;
-        const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
-        await pc.setLocalDescription(offer);
-        const envelope: SignalEnvelope = {
-          channel: 'student-to-host',
-          sdp: pc.localDescription?.toJSON() ?? offer,
-        };
-        await sendLiveClassSignal(activeClassId, instructorUid, 'offer', JSON.stringify(envelope));
-      } catch (err) {
-        console.error('Student WebRTC offer error:', err);
+      if (studentOutboundPcRef.current) {
+        studentOutboundPcRef.current.close();
+        studentOutboundPcRef.current = null;
       }
-    };
 
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) {
-        const envelope: SignalEnvelope = {
-          channel: 'student-to-host',
-          candidate: ev.candidate.toJSON(),
-        };
-        void sendLiveClassSignal(activeClassId, instructorUid, 'ice', JSON.stringify(envelope));
-      }
-    };
+      const pc = new RTCPeerConnection(rtcCfg);
+      activePc = pc;
+      studentOutboundPcRef.current = pc;
 
-    pc.oniceconnectionstatechange = () => {
-      if (pc.iceConnectionState === 'failed') {
-        pc.restartIce();
-        void sendStudentOffer(true);
-      }
-    };
+      localStudentStream.getTracks().forEach((track) => {
+        pc.addTrack(track, localStudentStream);
+      });
+      void tuneVideoSenderBitrate(pc, 'student');
 
-    void sendStudentOffer(false);
+      const sendStudentOffer = async (iceRestart = false) => {
+        try {
+          if (pc.signalingState === 'closed') return;
+          const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
+          await pc.setLocalDescription(offer);
+          const envelope: SignalEnvelope = {
+            channel: 'student-to-host',
+            sdp: pc.localDescription?.toJSON() ?? offer,
+          };
+          await sendLiveClassSignal(activeClassId, instructorUid, 'offer', JSON.stringify(envelope));
+        } catch (err) {
+          console.error('Student WebRTC offer error:', err);
+        }
+      };
+
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          const envelope: SignalEnvelope = {
+            channel: 'student-to-host',
+            candidate: ev.candidate.toJSON(),
+          };
+          void sendLiveClassSignal(activeClassId, instructorUid, 'ice', JSON.stringify(envelope));
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        const st = pc.iceConnectionState;
+        if (st === 'connected' || st === 'completed') {
+          setRtcNetworkStatus('stable');
+        } else if (st === 'disconnected') {
+          setRtcNetworkStatus('reconnecting');
+        } else if (st === 'failed') {
+          setRtcNetworkStatus('reconnecting');
+          pc.restartIce();
+          void sendStudentOffer(true);
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') {
+          setRtcNetworkStatus('stable');
+        } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          setRtcNetworkStatus('disconnected');
+        }
+      };
+
+      void sendStudentOffer(false);
+    })();
 
     return () => {
-      if (studentOutboundPcRef.current === pc) {
-        pc.close();
+      cancelled = true;
+      if (activePc && studentOutboundPcRef.current === activePc) {
+        activePc.close();
         studentOutboundPcRef.current = null;
       }
     };
@@ -655,6 +1288,7 @@ export const LiveClassroomView: React.FC = () => {
     myParticipant?.canPublishMedia,
     instructorUid,
     rtcReconnectSeq,
+    ensureRtcConfigReady,
     sendLiveClassSignal,
   ]);
 
@@ -689,51 +1323,78 @@ export const LiveClassroomView: React.FC = () => {
         }
         if (!parsed) return;
 
+        // 0) Host receiving student 'viewer-hello' (late join / page refresh / reconnect)
+        if (parsed.channel === 'viewer-hello' && isAdmin && sig.type === 'hello') {
+          if (localHostStreamRef.current) {
+            helloPeerGraceRef.current.set(sig.fromUid, Date.now());
+            void createHostPeerOfferForStudentRef.current(sig.fromUid, true);
+          }
+          return;
+        }
+
         // 1) Student receiving Host broadcast ('host-to-student')
         if (parsed.channel === 'host-to-student' && !isAdmin) {
           const iceKey = `host:${sig.fromUid}`;
           if (sig.type === 'offer' && parsed.sdp) {
-            if (incomingHostPcRef.current) {
-              incomingHostPcRef.current.close();
-            }
-            const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
-            incomingHostPcRef.current = pc;
-            setRtcNetworkStatus('connecting');
-            const inboundStream = new MediaStream();
-
-            pc.ontrack = (ev) => {
-              ev.streams[0]?.getTracks().forEach((t) => {
-                if (!inboundStream.getTracks().some((ex) => ex.id === t.id)) {
-                  inboundStream.addTrack(t);
-                }
-              });
-              if (!inboundStream.getTracks().some((ex) => ex.id === ev.track.id)) {
-                inboundStream.addTrack(ev.track);
-              }
-              setRemoteHostStream(new MediaStream(inboundStream.getTracks()));
-            };
-
-            pc.oniceconnectionstatechange = () => {
-              const st = pc.iceConnectionState;
-              if (st === 'connected' || st === 'completed') {
-                setRtcNetworkStatus('connected');
-              } else if (st === 'disconnected' || st === 'failed') {
-                setRtcNetworkStatus('reconnecting');
-              }
-            };
-
-            pc.onicecandidate = (ev) => {
-              if (ev.candidate) {
-                const env: SignalEnvelope = {
-                  channel: 'host-to-student',
-                  candidate: ev.candidate.toJSON(),
-                };
-                void sendLiveClassSignal(activeClassId, sig.fromUid, 'ice', JSON.stringify(env));
-              }
-            };
-
             void (async () => {
               try {
+                const rtcCfg = await ensureRtcConfigReady();
+                if (incomingHostPcRef.current) {
+                  incomingHostPcRef.current.close();
+                }
+                const pc = new RTCPeerConnection(rtcCfg);
+                incomingHostPcRef.current = pc;
+                setRtcNetworkStatus('connecting');
+                const inboundStream = new MediaStream();
+
+                pc.ontrack = (ev) => {
+                  ev.streams[0]?.getTracks().forEach((t) => {
+                    if (!inboundStream.getTracks().some((ex) => ex.id === t.id)) {
+                      inboundStream.addTrack(t);
+                    }
+                  });
+                  if (!inboundStream.getTracks().some((ex) => ex.id === ev.track.id)) {
+                    inboundStream.addTrack(ev.track);
+                  }
+                  setRemoteHostStream(new MediaStream(inboundStream.getTracks()));
+                };
+
+                pc.oniceconnectionstatechange = () => {
+                  const st = pc.iceConnectionState;
+                  if (st === 'connected' || st === 'completed') {
+                    setRtcNetworkStatus('stable');
+                  } else if (st === 'checking' || st === 'new') {
+                    setRtcNetworkStatus('connecting');
+                  } else if (st === 'disconnected') {
+                    setRtcNetworkStatus('reconnecting');
+                  } else if (st === 'failed') {
+                    setRtcNetworkStatus('disconnected');
+                  }
+                };
+
+                pc.onconnectionstatechange = () => {
+                  const cs = pc.connectionState;
+                  if (cs === 'connected') {
+                    setRtcNetworkStatus('stable');
+                  } else if (cs === 'connecting') {
+                    setRtcNetworkStatus('connecting');
+                  } else if (cs === 'disconnected') {
+                    setRtcNetworkStatus('reconnecting');
+                  } else if (cs === 'failed' || cs === 'closed') {
+                    setRtcNetworkStatus('disconnected');
+                  }
+                };
+
+                pc.onicecandidate = (ev) => {
+                  if (ev.candidate) {
+                    const env: SignalEnvelope = {
+                      channel: 'host-to-student',
+                      candidate: ev.candidate.toJSON(),
+                    };
+                    void sendLiveClassSignal(activeClassId, sig.fromUid, 'ice', JSON.stringify(env));
+                  }
+                };
+
                 await pc.setRemoteDescription(new RTCSessionDescription(parsed.sdp!));
                 await flushIce(iceKey, pc);
                 const answer = await pc.createAnswer();
@@ -745,6 +1406,7 @@ export const LiveClassroomView: React.FC = () => {
                 await sendLiveClassSignal(activeClassId, sig.fromUid, 'answer', JSON.stringify(env));
               } catch (err) {
                 console.error('Student handling host offer error:', err);
+                setRtcNetworkStatus('disconnected');
               }
             })();
           } else if (sig.type === 'ice' && parsed.candidate) {
@@ -794,38 +1456,42 @@ export const LiveClassroomView: React.FC = () => {
           }
           const iceKey = `student-in:${sig.fromUid}`;
           if (sig.type === 'offer' && parsed.sdp) {
-            incomingStudentPeersRef.current.get(sig.fromUid)?.close();
-            const pc = new RTCPeerConnection(effectiveRtcConfigRef.current);
-            incomingStudentPeersRef.current.set(sig.fromUid, pc);
-            const inboundStream = new MediaStream();
-
-            pc.ontrack = (ev) => {
-              ev.streams[0]?.getTracks().forEach((t) => {
-                if (!inboundStream.getTracks().some((ex) => ex.id === t.id)) {
-                  inboundStream.addTrack(t);
-                }
-              });
-              if (!inboundStream.getTracks().some((ex) => ex.id === ev.track.id)) {
-                inboundStream.addTrack(ev.track);
-              }
-              setRemoteStudentStreams((prev) => ({
-                ...prev,
-                [sig.fromUid]: new MediaStream(inboundStream.getTracks()),
-              }));
-            };
-
-            pc.onicecandidate = (ev) => {
-              if (ev.candidate) {
-                const env: SignalEnvelope = {
-                  channel: 'student-to-host',
-                  candidate: ev.candidate.toJSON(),
-                };
-                void sendLiveClassSignal(activeClassId, sig.fromUid, 'ice', JSON.stringify(env));
-              }
-            };
-
             void (async () => {
               try {
+                const rtcCfg = await ensureRtcConfigReady();
+                incomingStudentPeersRef.current.get(sig.fromUid)?.close();
+                const pc = new RTCPeerConnection(rtcCfg);
+                incomingStudentPeersRef.current.set(sig.fromUid, pc);
+                const inboundStream = new MediaStream();
+
+                pc.ontrack = (ev) => {
+                  ev.streams[0]?.getTracks().forEach((t) => {
+                    if (!inboundStream.getTracks().some((ex) => ex.id === t.id)) {
+                      inboundStream.addTrack(t);
+                    }
+                  });
+                  if (!inboundStream.getTracks().some((ex) => ex.id === ev.track.id)) {
+                    inboundStream.addTrack(ev.track);
+                  }
+                  setRemoteStudentStreams((prev) => ({
+                    ...prev,
+                    [sig.fromUid]: new MediaStream(inboundStream.getTracks()),
+                  }));
+                };
+
+                pc.onicecandidate = (ev) => {
+                  if (ev.candidate) {
+                    const env: SignalEnvelope = {
+                      channel: 'student-to-host',
+                      candidate: ev.candidate.toJSON(),
+                    };
+                    void sendLiveClassSignal(activeClassId, sig.fromUid, 'ice', JSON.stringify(env));
+                  }
+                };
+
+                pc.oniceconnectionstatechange = () => syncHostAggregateStatusRef.current();
+                pc.onconnectionstatechange = () => syncHostAggregateStatusRef.current();
+
                 await pc.setRemoteDescription(new RTCSessionDescription(parsed.sdp!));
                 await flushIce(iceKey, pc);
                 const answer = await pc.createAnswer();
@@ -887,6 +1553,7 @@ export const LiveClassroomView: React.FC = () => {
     activeClassId,
     hasClassAccess,
     isAdmin,
+    ensureRtcConfigReady,
     subscribeLiveClassSignals,
     consumeLiveClassSignal,
     sendLiveClassSignal,
@@ -1029,6 +1696,7 @@ export const LiveClassroomView: React.FC = () => {
     setLocalHostStream(result.stream);
     setMediaMode('camera');
     setHostMicEnabled(result.hasAudio);
+    startCloudRelayBroadcaster(activeClassId, result.stream);
     await updateHostMediaState(activeClassId, 'camera', result.hasAudio);
     await upsertMyLiveClassPresence(activeClassId, {
       cameraActive: result.hasVideo,
@@ -1094,6 +1762,7 @@ export const LiveClassroomView: React.FC = () => {
       setLocalHostStream(displayStream);
       setMediaMode('screen');
       setHostMicEnabled(hasAudio);
+      startCloudRelayBroadcaster(activeClassId, displayStream);
       await updateHostMediaState(activeClassId, 'screen', hasAudio);
       await upsertMyLiveClassPresence(activeClassId, {
         cameraActive: true,
@@ -1256,9 +1925,191 @@ export const LiveClassroomView: React.FC = () => {
   );
 
   const activeHostStream = isAdmin ? localHostStream : remoteHostStream;
+  const useCloudRelayView =
+    !isAdmin &&
+    (manualCloudRelay || (autoCloudRelay && !remoteHostStream)) &&
+    Boolean(activeClass?.hostMediaMode && activeClass.hostMediaMode !== 'none');
   const hostBroadcastActive = isAdmin
     ? mediaMode !== 'none'
     : Boolean(activeClass?.hostMediaMode && activeClass.hostMediaMode !== 'none') || Boolean(remoteHostStream);
+
+  // Measure real-time RTT and active ICE candidate route (TURN Relay vs STUN vs Direct) via RTCPeerConnection.getStats()
+  useEffect(() => {
+    if (!hostBroadcastActive && rtcNetworkStatus !== 'stable') {
+      setRtcQuality({ rttMs: null, route: null });
+      return;
+    }
+    if (useCloudRelayView && cloudRelayStatus === 'playing') {
+      setRtcQuality({ rttMs: null, route: 'cloud' });
+      return;
+    }
+
+    const inspectStats = async () => {
+      const candidatePc = isAdmin
+        ? Array.from(hostOutboundPeersRef.current.values()).find(
+            (p) => p.connectionState === 'connected' || p.iceConnectionState === 'connected'
+          ) ?? Array.from(hostOutboundPeersRef.current.values())[0]
+        : incomingHostPcRef.current ?? studentOutboundPcRef.current;
+
+      if (!candidatePc || candidatePc.signalingState === 'closed') {
+        setRtcQuality({ rttMs: null, route: null });
+        return;
+      }
+
+      try {
+        const stats = await candidatePc.getStats();
+        let activePair: { currentRoundTripTime?: number; remoteCandidateId?: string; localCandidateId?: string } | null = null;
+        const candidates = new Map<string, { candidateType?: string }>();
+
+        stats.forEach((report) => {
+          if (report.type === 'candidate-pair') {
+            const pair = report as {
+              nominated?: boolean;
+              state?: string;
+              currentRoundTripTime?: number;
+              remoteCandidateId?: string;
+              localCandidateId?: string;
+            };
+            if (pair.nominated || pair.state === 'succeeded') {
+              activePair = pair;
+            }
+          } else if (report.type === 'remote-candidate' || report.type === 'local-candidate') {
+            const c = report as { id: string; candidateType?: string };
+            candidates.set(c.id, c);
+          }
+        });
+
+        if (activePair) {
+          const rttSec = (activePair as { currentRoundTripTime?: number }).currentRoundTripTime;
+          const rttMs = typeof rttSec === 'number' && Number.isFinite(rttSec) ? Math.round(rttSec * 1000) : null;
+          const remoteType = candidates.get((activePair as { remoteCandidateId?: string }).remoteCandidateId || '')?.candidateType;
+          const localType = candidates.get((activePair as { localCandidateId?: string }).localCandidateId || '')?.candidateType;
+          let route: RtcQualityMetrics['route'] = 'direct';
+          if (remoteType === 'relay' || localType === 'relay') {
+            route = 'turn';
+          } else if (remoteType === 'srflx' || remoteType === 'prflx' || localType === 'srflx') {
+            route = 'stun';
+          }
+          setRtcQuality({ rttMs, route });
+        }
+      } catch {
+        // ignore transient getStats failure
+      }
+    };
+
+    void inspectStats();
+    const timer = window.setInterval(() => {
+      void inspectStats();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [hostBroadcastActive, rtcNetworkStatus, useCloudRelayView, cloudRelayStatus, isAdmin]);
+
+  const effectiveConnectionIndicator = useMemo(() => {
+    if (!isBrowserOnline) {
+      return {
+        state: 'disconnected' as const,
+        label: 'قطع ارتباط (Disconnected)',
+        detail: 'اتصال اینترنت دستگاه قطع است',
+        badgeCls: 'bg-rose-950/80 border-rose-700/70 text-rose-300',
+        dotCls: 'bg-rose-500',
+      };
+    }
+
+    if (useCloudRelayView) {
+      if (cloudRelayStatus === 'playing') {
+        return {
+          state: 'stable' as const,
+          label: 'پایدار (Stable · HTTPS)',
+          detail: 'متصل از طریق سرور پخش ابری سازگار با همه اینترنت‌ها',
+          badgeCls: 'bg-emerald-950/70 border-emerald-700/70 text-emerald-300',
+          dotCls: 'bg-emerald-400',
+        };
+      }
+      if (cloudRelayStatus === 'waiting') {
+        return {
+          state: 'disconnected' as const,
+          label: 'قطع ارتباط (Disconnected)',
+          detail: 'در انتظار دریافت جریان زنده از مرورگر استاد',
+          badgeCls: 'bg-rose-950/80 border-rose-700/70 text-rose-300',
+          dotCls: 'bg-rose-500',
+        };
+      }
+      return {
+        state: 'reconnecting' as const,
+        label: 'در حال اتصال مجدد (Reconnecting)',
+        detail: 'در حال همگام‌سازی استریم ابری HTTPS',
+        badgeCls: 'bg-amber-950/70 border-amber-700/70 text-amber-300',
+        dotCls: 'bg-amber-400',
+      };
+    }
+
+    if (rtcNetworkStatus === 'stable') {
+      const highLatency = rtcQuality.rttMs !== null && rtcQuality.rttMs > 450;
+      return {
+        state: 'stable' as const,
+        label: highLatency ? 'پایدار · تاخیر بالا' : 'پایدار (Stable)',
+        detail:
+          rtcQuality.route === 'turn'
+            ? 'اتصال فعال از طریق سرور رله TURN'
+            : rtcQuality.route === 'stun'
+              ? 'اتصال بین‌شبکه‌ای از طریق STUN'
+              : 'ارتباط زنده پایدار برقرار است',
+        badgeCls: highLatency
+          ? 'bg-amber-950/70 border-amber-700/70 text-amber-300'
+          : 'bg-emerald-950/70 border-emerald-700/70 text-emerald-300',
+        dotCls: highLatency ? 'bg-amber-400' : 'bg-emerald-400',
+      };
+    }
+
+    if (rtcNetworkStatus === 'reconnecting') {
+      return {
+        state: 'reconnecting' as const,
+        label: 'در حال اتصال مجدد (Reconnecting)',
+        detail: 'اختلال موقت شبکه — در حال بازیابی مسیر ICE/TURN',
+        badgeCls: 'bg-amber-950/70 border-amber-700/70 text-amber-300',
+        dotCls: 'bg-amber-400',
+      };
+    }
+
+    if (rtcNetworkStatus === 'disconnected') {
+      return {
+        state: 'disconnected' as const,
+        label: 'قطع ارتباط (Disconnected)',
+        detail: 'ارتباط همتا قطع شد — روی «بازنشانی اتصال» یا «پخش ابری» بزنید',
+        badgeCls: 'bg-rose-950/80 border-rose-700/70 text-rose-300',
+        dotCls: 'bg-rose-500',
+      };
+    }
+
+    if (rtcNetworkStatus === 'connecting' || (hostBroadcastActive && !isAdmin)) {
+      return {
+        state: 'connecting' as const,
+        label: 'در حال اتصال (Connecting)',
+        detail: 'در حال مذاکره ICE با سرورهای STUN/TURN',
+        badgeCls: 'bg-sky-950/70 border-sky-700/70 text-sky-300',
+        dotCls: 'bg-sky-400',
+      };
+    }
+
+    return {
+      state: 'stable' as const,
+      label: 'پایدار (Ready)',
+      detail: baseRtcConfig.hasCustomTurn
+        ? 'پیکربندی STUN و TURN اختصاصی آماده است'
+        : 'سرورهای STUN و رله TURN آماده برقراری ارتباط هستند',
+      badgeCls: 'bg-slate-800/90 border-slate-700 text-slate-300',
+      dotCls: 'bg-emerald-400',
+    };
+  }, [
+    isBrowserOnline,
+    useCloudRelayView,
+    cloudRelayStatus,
+    rtcNetworkStatus,
+    rtcQuality,
+    hostBroadcastActive,
+    isAdmin,
+    baseRtcConfig.hasCustomTurn,
+  ]);
 
   const remoteStudentEntries = useMemo(
     () =>
@@ -1472,13 +2323,29 @@ export const LiveClassroomView: React.FC = () => {
             {/* Live Stage Header + Admin Broadcast Controls */}
             <div className="bg-slate-900 text-white border border-slate-800 rounded-2xl overflow-hidden">
               <div className="px-5 py-3.5 bg-slate-950 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-2.5 text-xs font-semibold">
+                <div className="flex flex-wrap items-center gap-2.5 text-xs font-semibold">
                   <span className={`w-2.5 h-2.5 rounded-full ${statusMeta(activeClass.status).dotCls}`} />
                   <span className={activeClass.status === 'live' ? 'text-emerald-400' : 'text-slate-300'}>
                     {statusMeta(activeClass.status).label}
                   </span>
                   <span className="text-slate-600">|</span>
                   <span className="text-slate-300">{activeClass.subject}</span>
+                  <span
+                    className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md border text-[11px] font-semibold ${effectiveConnectionIndicator.badgeCls}`}
+                    title={effectiveConnectionIndicator.detail}
+                  >
+                    {effectiveConnectionIndicator.state === 'disconnected' ? (
+                      <WifiOff className="w-3 h-3" />
+                    ) : effectiveConnectionIndicator.state === 'reconnecting' ? (
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <span className={`w-1.5 h-1.5 rounded-full ${effectiveConnectionIndicator.dotCls}`} />
+                    )}
+                    <span>{effectiveConnectionIndicator.label}</span>
+                    {rtcQuality.rttMs !== null && effectiveConnectionIndicator.state === 'stable' && (
+                      <span className="opacity-80 font-mono">({toPersianDigits(rtcQuality.rttMs)}ms)</span>
+                    )}
+                  </span>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -1601,6 +2468,34 @@ export const LiveClassroomView: React.FC = () => {
                     </span>
                   </button>
 
+                  {!isAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setManualCloudRelay((prev) => {
+                          const next = !prev;
+                          notify(
+                            next
+                              ? 'پخش ابری HTTPS (سازگار با همه اینترنت‌ها و شبکه‌های موبایل) فعال شد.'
+                              : 'حالت ارتباط مستقیم وب‌سی‌آرتی‌سی فعال شد.',
+                            'info'
+                          );
+                          return next;
+                        });
+                      }}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg cursor-pointer ${
+                        useCloudRelayView
+                          ? 'bg-emerald-700 hover:bg-emerald-600 text-white'
+                          : 'bg-slate-800 hover:bg-slate-700 text-emerald-300'
+                      }`}
+                    >
+                      <Cloud className="w-3.5 h-3.5" />
+                      <span>
+                        {useCloudRelayView ? 'پخش ابری فعال (HTTPS)' : 'پخش ابری (همه اینترنت‌ها)'}
+                      </span>
+                    </button>
+                  )}
+
                   {(hostBroadcastActive || rtcNetworkStatus !== 'idle') && (
                     <button
                       type="button"
@@ -1627,33 +2522,35 @@ export const LiveClassroomView: React.FC = () => {
                 </div>
               </div>
 
-              {hostBroadcastActive && rtcNetworkStatus !== 'idle' && (
+              {(hostBroadcastActive || rtcNetworkStatus !== 'idle' || !isBrowserOnline) && (
                 <div className="px-5 py-2 bg-slate-900/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-300">
                   <div className="flex items-center gap-2">
-                    <Wifi
-                      className={`w-3.5 h-3.5 ${
-                        rtcNetworkStatus === 'connected'
-                          ? 'text-emerald-400'
-                          : rtcNetworkStatus === 'reconnecting'
-                            ? 'text-amber-400'
-                            : 'text-sky-400'
-                      }`}
-                    />
+                    {effectiveConnectionIndicator.state === 'disconnected' ? (
+                      <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                    ) : useCloudRelayView ? (
+                      <Cloud className="w-3.5 h-3.5 text-emerald-400" />
+                    ) : (
+                      <Wifi
+                        className={`w-3.5 h-3.5 ${
+                          effectiveConnectionIndicator.state === 'stable'
+                            ? 'text-emerald-400'
+                            : effectiveConnectionIndicator.state === 'reconnecting'
+                              ? 'text-amber-400'
+                              : 'text-sky-400'
+                        }`}
+                      />
+                    )}
                     <span>
-                      وضعیت انتقال بین‌شبکه‌ای:{' '}
-                      <strong className="text-white">
-                        {rtcNetworkStatus === 'connected'
-                          ? forceRelayMode
-                            ? 'متصل از طریق سرور رله (TURN/TLS)'
-                            : 'متصل و پایدار'
-                          : rtcNetworkStatus === 'reconnecting'
-                            ? 'در حال بازنشانی خودکار مسیر شبکه...'
-                            : 'در حال برقراری ارتباط با سرورهای TURN/STUN...'}
-                      </strong>
+                      وضعیت کیفیت شبکه:{' '}
+                      <strong className="text-white">{effectiveConnectionIndicator.label}</strong>
+                      {' — '}
+                      <span className="text-slate-300">{effectiveConnectionIndicator.detail}</span>
                     </span>
                   </div>
                   <span className="text-slate-400">
-                    در صورت اختلاف اینترنت یا شبکه موبایل، دکمه «حالت رله (اینترنت‌های مختلف)» را بزنید.
+                    {baseRtcConfig.hasCustomTurn
+                      ? 'رله اختصاصی TURN/STUN فعال است'
+                      : 'سرورهای عمومی STUN/TURN + پخش ابری HTTPS آماده انتقال بین‌شبکه‌ای'}
                   </span>
                 </div>
               )}
@@ -1706,18 +2603,36 @@ export const LiveClassroomView: React.FC = () => {
               {/* Instructor Live Video / Audio / Screen Share Stage */}
               {hostBroadcastActive && (
                 <div className="bg-black border-b border-slate-800 relative">
-                  {activeHostStream ? (
+                  {!isAdmin && autoplayAudioBlocked && (
+                    <div className="p-2.5 bg-amber-600 text-white flex items-center justify-center">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAutoplayAudioBlocked(false);
+                          setRemoteHostAudioMuted(false);
+                        }}
+                        className="inline-flex items-center gap-2 text-xs font-bold cursor-pointer hover:underline"
+                      >
+                        <Volume2 className="w-4 h-4" />
+                        <span>صدا توسط مرورگر بی‌صدا شده است — برای شنیدن صدای استاد اینجا کلیک کنید</span>
+                      </button>
+                    </div>
+                  )}
+
+                  {activeHostStream && !useCloudRelayView ? (
                     activeHostStream.getVideoTracks().length > 0 ? (
                       <StreamVideo
                         stream={activeHostStream}
-                        muted={isAdmin || remoteHostAudioMuted}
+                        muted={isAdmin || remoteHostAudioMuted || autoplayAudioBlocked}
+                        onAutoplayBlocked={() => setAutoplayAudioBlocked(true)}
                         className="w-full max-h-[380px] object-contain mx-auto bg-black"
                       />
                     ) : (
                       <div className="py-10 px-6 text-center space-y-2 relative">
                         <StreamVideo
                           stream={activeHostStream}
-                          muted={isAdmin || remoteHostAudioMuted}
+                          muted={isAdmin || remoteHostAudioMuted || autoplayAudioBlocked}
+                          onAutoplayBlocked={() => setAutoplayAudioBlocked(true)}
                           className="w-px h-px opacity-0 pointer-events-none absolute"
                         />
                         <Mic className="w-7 h-7 text-emerald-400 mx-auto" />
@@ -1729,8 +2644,23 @@ export const LiveClassroomView: React.FC = () => {
                         </p>
                       </div>
                     )
+                  ) : useCloudRelayView ? (
+                    <div className="relative">
+                      <CloudRelayPlayer
+                        classId={activeClass.id}
+                        muted={remoteHostAudioMuted || autoplayAudioBlocked}
+                        onAutoplayBlocked={() => setAutoplayAudioBlocked(true)}
+                        onStatusChange={setCloudRelayStatus}
+                        className="w-full max-h-[380px] object-contain mx-auto bg-black"
+                      />
+                      {cloudRelayStatus !== 'playing' && (
+                        <div className="py-4 px-6 text-center text-xs text-slate-300 bg-slate-950/90 border-t border-slate-800">
+                          در حال همگام‌سازی استریم ابری (HTTPS) با مرورگر استاد...
+                        </div>
+                      )}
+                    </div>
                   ) : (
-                    <div className="py-16 px-6 text-center space-y-2">
+                    <div className="py-16 px-6 text-center space-y-3">
                       <Radio className="w-7 h-7 text-emerald-400 mx-auto" />
                       <p className="text-sm font-bold text-slate-200">
                         {activeClass.hostMediaMode === 'screen'
@@ -1738,10 +2668,18 @@ export const LiveClassroomView: React.FC = () => {
                           : 'استاد در حال پخش زنده تصویر یا صدا است'}
                       </p>
                       <p className="text-xs text-slate-400">
-                        {user
-                          ? 'در حال برقراری ارتباط زنده تصویر و صدا با مرورگر استاد...'
-                          : 'برای دریافت تصویر زنده استاد با حساب خود وارد شوید.'}
+                        در حال برقراری ارتباط زنده تصویر و صدا با مرورگر استاد... (در صورت کندی شبکه، پخش ابری به‌طور خودکار فعال می‌شود)
                       </p>
+                      {!isAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => setManualCloudRelay(true)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold rounded-lg cursor-pointer"
+                        >
+                          <Cloud className="w-3.5 h-3.5" />
+                          <span>اتصال فوری با پخش ابری (همه اینترنت‌ها)</span>
+                        </button>
+                      )}
                     </div>
                   )}
 
@@ -1769,18 +2707,27 @@ export const LiveClassroomView: React.FC = () => {
                       </span>
                     </div>
 
-                    {!isAdmin && activeHostStream && (
+                    {!isAdmin && (activeHostStream || useCloudRelayView) && (
                       <button
                         type="button"
-                        onClick={() => setRemoteHostAudioMuted((m) => !m)}
+                        onClick={() => {
+                          if (autoplayAudioBlocked) {
+                            setAutoplayAudioBlocked(false);
+                            setRemoteHostAudioMuted(false);
+                          } else {
+                            setRemoteHostAudioMuted((m) => !m);
+                          }
+                        }}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg cursor-pointer"
                       >
-                        {remoteHostAudioMuted ? (
+                        {remoteHostAudioMuted || autoplayAudioBlocked ? (
                           <VolumeX className="w-3.5 h-3.5 text-amber-400" />
                         ) : (
                           <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
                         )}
-                        <span>{remoteHostAudioMuted ? 'وصل صدای پخش' : 'بی‌صدا کردن'}</span>
+                        <span>
+                          {remoteHostAudioMuted || autoplayAudioBlocked ? 'وصل صدای پخش' : 'بی‌صدا کردن'}
+                        </span>
                       </button>
                     )}
                   </div>
